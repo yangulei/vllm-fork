@@ -463,6 +463,11 @@ class DummyModelLoader(BaseModelLoader):
             initialize_dummy_weights(model)
 
             _process_weights_after_loading(model, model_config, target_device)
+                if isinstance(module, Attention) and \
+                    hasattr(module, "process_weights_after_loading"):
+                    # When attention modules need to process weights after
+                    # currently only used by MLA
+                    module.process_weights_after_loading(model_config.dtype)
         return model.eval()
 
 
@@ -656,6 +661,12 @@ class ShardedStateLoader(BaseModelLoader):
                 model = _initialize_model(vllm_config=vllm_config)
                 _process_weights_after_loading(model, model_config,
                                                target_device)
+                    if isinstance(module, Attention) and \
+                        hasattr(module, "process_weights_after_loading"):
+                        # When attention modules need to process weights after
+                        # currently only used by MLA
+                        module.process_weights_after_loading(
+                            model_config.dtype)
             rank = get_tensor_model_parallel_rank()
             pattern = os.path.join(
                 local_model_path,
@@ -1406,6 +1417,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                                            model_config.revision))
 
             _process_weights_after_loading(model, model_config, target_device)
+                if isinstance(module, Attention) and \
+                    hasattr(module, "process_weights_after_loading"):
+                    # When attention modules need to process weights after
+                    # currently only used by MLA
+                    module.process_weights_after_loading(model_config.dtype)
         return model.eval()
 
 

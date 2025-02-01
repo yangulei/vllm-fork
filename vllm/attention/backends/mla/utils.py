@@ -2,9 +2,10 @@
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Generic, List, Optional, Tuple
+from typing import Any, Dict, Generic, List, Optional, Tuple, Tuple
 
 import torch
+from compressed_tensors.quantization import QuantizationStrategy
 from compressed_tensors.quantization import QuantizationStrategy
 
 from vllm import _custom_ops as ops
@@ -13,11 +14,22 @@ from vllm.attention.backends.abstract import (AttentionLayer,
                                               AttentionMetadata,
                                               MLAAttentionImpl, T)
 from vllm.attention.backends.utils import get_flash_attn_version
-from vllm.distributed import (get_tensor_model_parallel_world_size,
+from vllm.distributed import ((get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce),
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               LinearBase, RowParallelLinear,
+                                               LinearBase, LinearBase, RowParallelLinear,
+                                               UnquantizedLinearMethod,
                                                UnquantizedLinearMethod)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsLinearMethod)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8)
+from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    apply_fp8_linear_generic, current_platform_fp8_dtype, is_fp8)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    scaled_dequantize, scaled_quantize)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsLinearMethod)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (

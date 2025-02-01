@@ -4,12 +4,21 @@
 import functools
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+import functools
+import json
+import os
+from typing import Any, Dict, Any, Dict, List, Optional, Tuple, Union, Union
 
 import torch
 import triton
 import triton.language as tl
 
+from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    _normalize_quant_group_shape, scaled_dequantize)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    apply_fp8_linear)
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -169,6 +178,42 @@ def apply_block_fp8_linear_hpu(
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
+
+
+# Unify the interface between `apply_w8a8_block_fp8_linear` and
+# `apply_fp8_linear`
+# NOTE(lucas): this is quite messy, we should think through this more formally
+def apply_fp8_linear_generic(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_group_shape: Tuple[int, int],
+        weight_group_shape: Tuple[int, int],
+        input_scale: Optional[torch.Tensor] = None,  # static scale if one
+) -> torch.Tensor:
+    # View input as 2D matrix for fp8 methods
+    input = input.view(-1, input.shape[-1])
+
+    weight_group_shape = _normalize_quant_group_shape(\
+        weight, weight_group_shape)
+    input_group_shape = _normalize_quant_group_shape(input, input_group_shape)
+
+    def is_dim_blocked(dim, shape, group_shape):
+        return group_shape < shape[dim] and group_shape > 1
+
+    if is_dim_blocked(0, weight.shape, weight_group_shape[0])\
+     and is_dim_blocked(1, weight.shape, weight_group_shape[1]) and\
+     input_group_shape == (1, weight_group_shape[1]):
+        return apply_w8a8_block_fp8_linear(input, weight,
+                                           list(weight_group_shape),
+                                           weight_scale)
+    else:
+        # Despite having linear in the it doesn't conform to
+        # `torch.nn.functional.linear` which is defined as `input @ weight.T`
+        # so we explicitly transpose the weight matrix here
+        return apply_fp8_linear(input, weight.T, weight_scale.T,
+                         use_per_token_if_dynamic=\
+                             (input_group_shape == (1, input.shape[1])))
 
 
 # Unify the interface between `apply_w8a8_block_fp8_linear` and
