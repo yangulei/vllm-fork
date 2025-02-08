@@ -1955,6 +1955,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.bucketing_ctx.generate_prompt_buckets()
         if not self.is_pooler:
             self.bucketing_ctx.generate_decode_buckets(max_blocks)
+        
         if not htorch.utils.internal.is_lazy() and not self.enforce_eager:
             multiplier = 3 if os.getenv('VLLM_REGIONAL_COMPILATION',
                                         'true').lower() == 'true' else 1
