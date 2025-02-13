@@ -58,6 +58,14 @@ from vllm.transformers_utils.s3_utils import glob as s3_glob
 from vllm.transformers_utils.utils import is_s3
 from vllm.utils import is_pin_memory_available
 
+import torch.distributed as dist
+is_hpu = current_platform.is_hpu()
+
+def hpu_distributed_barrier():
+    if is_hpu:
+        torch.hpu.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module,
@@ -433,6 +441,31 @@ class DefaultModelLoader(BaseModelLoader):
                             from checkpoint: {weights_not_loaded}"
 
                     logger.warning(warning_msg)
+            if is_hpu:
+                hpu_distributed_barrier()
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if isinstance(quant_method, QuantizeMethodBase):
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+                    if is_hpu:
+                        hpu_distributed_barrier()
+
+                if isinstance(module, Attention) and \
+                    hasattr(module, "process_weights_after_loading"):
+                    # When attention modules need to process weights after
+                    # currently only used by MLA
+                    # TODO(lucas): see if there is a way to unify the signatures
+                    # of process_weights_after_loading
+                    module.process_weights_after_loading(model_config.dtype)
+                    if is_hpu:
+                        hpu_distributed_barrier()
 
             _process_weights_after_loading(model, model_config, target_device)
 
