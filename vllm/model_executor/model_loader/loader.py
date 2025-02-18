@@ -437,32 +437,33 @@ class DefaultModelLoader(BaseModelLoader):
                     if is_hpu:
                         hpu_distributed_barrier()
 
-        if vllm_config.cache_config.cache_dtype == "fp8_inc":
-            from neural_compressor.torch.algorithms.fp8_quant._quant_common.helper_modules import PatchedVLLMKVCache
-            from neural_compressor.torch.algorithms.fp8_quant._core.patching_common import generate_model_info, parent_child_mod_dict
-            from neural_compressor.torch.algorithms.fp8_quant._quant_common.quant_config import QuantMode, ScaleFormat, Fp8cfg, ScaleMethod
-            from neural_compressor.torch.algorithms.fp8_quant.model_configs import ModuleExtraConfig, ModuleConfig
-            from neural_compressor.torch.algorithms.fp8_quant._core.quant_dequant import QuantInput, DequantOutput
-            import habana_frameworks.torch.core as htcore
-            generate_model_info(model)
+        #if vllm_config.cache_config.cache_dtype == "fp8_inc":
+        #if True:
+        #    from neural_compressor.torch.algorithms.fp8_quant._quant_common.helper_modules import PatchedVLLMKVCache
+        #    from neural_compressor.torch.algorithms.fp8_quant._core.patching_common import generate_model_info, parent_child_mod_dict
+        #    from neural_compressor.torch.algorithms.fp8_quant._quant_common.quant_config import QuantMode, ScaleFormat, Fp8cfg, ScaleMethod
+        #    from neural_compressor.torch.algorithms.fp8_quant.model_configs import ModuleExtraConfig, ModuleConfig
+        #    from neural_compressor.torch.algorithms.fp8_quant._core.quant_dequant import QuantInput, DequantOutput
+        #    import habana_frameworks.torch.core as htcore
+        #    generate_model_info(model)
 
-            cfg = Fp8cfg.parse({"scale_method": "UNIT_SCALE"})
-            for n, mod in model.named_modules():
-                if mod.__class__.__name__ == "VLLMKVCache":
-                    mod.__hqt_config__ = cfg
-                    mod_extra_config = ModuleExtraConfig(
-                        inputs=[QuantInput(lp_dtype=torch.float8_e4m3fn, hp_dtype=torch.bfloat16, scale_inv=torch.tensor(1., device='hpu:0', dtype=torch.bfloat16))],
-                        outputs=[DequantOutput(lp_dtype=torch.float8_e4m3fn, hp_dtype=torch.bfloat16, scale=torch.tensor(1., device='hpu:0', dtype=torch.bfloat16))],
-                        scale=ModuleConfig(inputs=[torch.tensor(1., device='hpu:0', dtype=torch.bfloat16)], outputs=[torch.tensor(1., device='hpu:0', dtype=torch.bfloat16)]),
-                        config_params={"lp_dtype": torch.float8_e4m3fn, "hp_dtype": torch.bfloat16},
-                    )
-                    parent = parent_child_mod_dict[mod].parent
-                    name = parent_child_mod_dict[mod].name
-                    patched_mod = PatchedVLLMKVCache(mod, parent, mod_extra_config)
-                    setattr(parent, name, patched_mod)
+        #    cfg = Fp8cfg.parse({"scale_method": "UNIT_SCALE"})
+        #    for n, mod in model.named_modules():
+        #        if mod.__class__.__name__ == "VLLMKVCache":
+        #            mod.__hqt_config__ = cfg
+        #            mod_extra_config = ModuleExtraConfig(
+        #                inputs=[QuantInput(lp_dtype=torch.float8_e4m3fn, hp_dtype=torch.bfloat16, scale_inv=torch.tensor(1., device='hpu:0', dtype=torch.bfloat16))],
+        #                outputs=[DequantOutput(lp_dtype=torch.float8_e4m3fn, hp_dtype=torch.bfloat16, scale=torch.tensor(1., device='hpu:0', dtype=torch.bfloat16))],
+        #                scale=ModuleConfig(inputs=[torch.tensor(1., device='hpu:0', dtype=torch.bfloat16)], outputs=[torch.tensor(1., device='hpu:0', dtype=torch.bfloat16)]),
+        #                config_params={"lp_dtype": torch.float8_e4m3fn, "hp_dtype": torch.bfloat16},
+        #            )
+        #            parent = parent_child_mod_dict[mod].parent
+        #            name = parent_child_mod_dict[mod].name
+        #            patched_mod = PatchedVLLMKVCache(mod, parent, mod_extra_config)
+        #            setattr(parent, name, patched_mod)
 
-            htcore.hpu_initialize(model, mark_only_scales_as_const=True)
-            htcore.mark_step()
+        #    htcore.hpu_initialize(model, mark_only_scales_as_const=True)
+        #    htcore.mark_step()
         return model.eval()
 
 

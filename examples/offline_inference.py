@@ -5,6 +5,7 @@ os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] = "true"
 os.environ["VLLM_MLA_DISABLE_REQUANTIZATION"] = "1"
 os.environ["VLLM_RAY_DISABLE_LOG_TO_DRIVER"] = "1"
 os.environ["RAY_IGNORE_UNHANDLED_ERRORS"] = "1"
+os.environ["PT_HPU_WEIGHT_SHARING"] = "0"
 
 if __name__ == "__main__":
 
@@ -18,9 +19,11 @@ if __name__ == "__main__":
     # Create a sampling params object.
     sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
 
-    model_name = "opensourcerelease/DeepSeek-R1-bf16"
-    model_name = "deepseek-ai/DeepSeek-R1"
-    model_name = "/data/models/DeepSeek-R1"
+    #model_name = "opensourcerelease/DeepSeek-R1-bf16"
+    #model_name = "deepseek-ai/DeepSeek-R1"
+    #model_name = "/data/models/DeepSeek-R1"
+    model_name = "/mengni/DeepSeek-V3-G2"
+    #model_name = "/mengni/DeepSeek-V3-bf16"
     # model_name = "/data/models/DeepSeek-R1-bf16"
     # model_name = "/data/models/DeepSeek-R1-bf16-small/"
     # model_name = "meta-llama/Meta-Llama-3-8B"
@@ -30,12 +33,18 @@ if __name__ == "__main__":
     llm = LLM(model=model_name,
             device="hpu",
             dtype="bfloat16",
+            kv_cache_dtype="fp8_inc",
+            #quantization="inc",
             #   load_format="dummy",
-            tensor_parallel_size=8,
+            tensor_parallel_size=4,
             trust_remote_code=True,
             max_model_len=1024)
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
+    import torch
+    if torch.distributed.get_rank() == 0:
+        import pdb;pdb.set_trace()
+    #print("!!!!!!", llm.llm_engine.model_executor.driver_worker.model_runner.model.model.model.layers[0])
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
     for output in outputs:
