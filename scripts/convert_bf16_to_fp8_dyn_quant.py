@@ -17,8 +17,8 @@ WEIGHT_SCALE_NAME = "weight_scale_inv" #"scale_weight"
 INPUT_SCALE_NAME = "scale_input"
 SCALE_DTYPE = torch.bfloat16
 SCALE_FILE_NAME = f"scales.{SAFETENSORS}"
-FULL_RANGE = torch.finfo(torch.float8_e4m3fn).max
-WEIGHT_BACKOFF = 0.5
+FULL_RANGE = 240.0 # 240.0 for G2, 448.0 for G3
+WEIGHT_BACKOFF = 1.0
 QUANT_MODULE_TYPES = (torch.nn.Linear,)
 SKIP_WEIGHT_LST = {
     "enorm.weight",
