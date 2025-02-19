@@ -291,6 +291,27 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 # standardize to (output, input)
                 return dequant_weights.T
             return layer.weight
+            if is_layer_fp8(layer):
+                if isinstance(layer.quant_method, \
+                    CompressedTensorsLinearMethod) and \
+                    isinstance(layer.scheme, CompressedTensorsW8A8Fp8):
+                    # NOTE(lucas): note sure why but `CompressedTensorsW8A8Fp8`
+                    # seems to store weights as (input, output) instead of
+                    # (output, input) so we need to transpose
+                    weight = layer.weight.T  # standardize to (output, input)
+                else:
+                    weight = layer.weight
+                
+                scales = get_scales(layer)
+                if len(scales.shape) > 1:
+                    _, weight_scale_group_shape = \
+                        get_scale_group_shapes_for_fp8(layer)
+                    return scaled_dequantize(weight, scales,
+                                             weight_scale_group_shape)
+                else:
+                    return weight.to(torch.float32) * scales.unsqueeze(1) 
+            else:
+                return layer.weight
 
         weight_dtype = get_layer_weight(self.kv_b_proj).dtype
         assert get_layer_weight(self.o_proj).dtype == weight_dtype
