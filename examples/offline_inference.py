@@ -41,10 +41,6 @@ if __name__ == "__main__":
             max_model_len=1024)
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
-    import torch
-    if torch.distributed.get_rank() == 0:
-        import pdb;pdb.set_trace()
-    #print("!!!!!!", llm.llm_engine.model_executor.driver_worker.model_runner.model.model.model.layers[0])
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
     for output in outputs:
