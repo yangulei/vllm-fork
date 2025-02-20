@@ -46,6 +46,10 @@ try:
 #     from vllm.vllm_flash_attn import flash_attn_varlen_func
 except ImportError:
     from flash_attn import flash_attn_varlen_func
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.platforms import current_platform
+
+# from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 
 @dataclass
@@ -248,6 +252,8 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                     return (1, weight_block_size[-1]), weight_block_size
                 else:
                     return (-1, -1), (-1, -1)  # per-tensor, per-tensor
+            elif current_platform.is_hpu():
+                return (-1, -1), (-1, 1)  # per-tensor, per-channel
             elif isinstance(layer.quant_method, CompressedTensorsLinearMethod)\
                 and isinstance(layer.scheme, CompressedTensorsW8A8Fp8):
                 # this is hacky but we always assume the for
@@ -302,6 +308,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 else:
                     weight = layer.weight
                 
+                # TODO@yangulei: check if needs to restore it
                 scales = get_scales(layer)
                 if len(scales.shape) > 1:
                     _, weight_scale_group_shape = \
