@@ -830,10 +830,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
                         #htcore.hpu_initialize(model, mark_only_scales_as_const=True)
                         #htcore.mark_step()
-
+                    print(self.model)
                     torch.distributed.barrier()
-                    htcore.hpu_initialize(self.model,
-                                          mark_only_scales_as_const=True)
+                    #htcore.hpu_initialize(self.model,
+                    #                      mark_only_scales_as_const=True)
                 self.inc_initialized_successfully = True
                 rank_debug(f"INC MODEL: \n{self.model}", target_rank=0)
                 rank_debug(f"INC MODEL: \n{self.model}", target_rank=15)
