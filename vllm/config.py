@@ -971,12 +971,12 @@ class ModelConfig:
 
     @property
     def use_mla(self) -> bool:
-        # if self.quantization is not None and self.quantization not in [\
-        #     "fp8", "compressed-tensors"]:
-        #     logger.warning(
-        #         "MLA is not supported with %s quantization. "
-        #         "Disabling MLA.", self.quantization)
-        #     return False
+        if self.quantization is not None and self.quantization not in [\
+            "fp8", "compressed-tensors"]:
+            logger.warning(
+                "MLA is not supported with %s quantization. "
+                "Disabling MLA.", self.quantization)
+            return False
 
         # If using a "compressed-tensors" checkpoint, check that all groups
         # have fp8 for both weights and activations.
