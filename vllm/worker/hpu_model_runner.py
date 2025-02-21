@@ -806,6 +806,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                     output_cache[i] = self.dequant_output(output_cache[i])
                                 return output_cache
                             output_cache = self.orig_mod.fetch_from_cache(quant_cache, blocks)
+                            print("$$$$$$$$$$")
                             return self.dequant_output(output_cache)
 
                         PatchedVLLMKVCache.forward_quant = forward_quant
