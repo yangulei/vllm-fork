@@ -230,6 +230,7 @@ if __name__ == "__main__":
         weights_load_device="cpu",
         max_model_len=16384,
         dtype="bfloat16",
+        kv_cache_dtype="fp8_inc",
     )
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
