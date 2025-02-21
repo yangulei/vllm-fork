@@ -493,7 +493,6 @@ def grouped_topk(hidden_states: torch.Tensor,
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
 
-    hidden_states = hidden_states.float()
     gating_output = gating_output.float()
     if e_score_correction_bias is not None:
         e_score_correction_bias = e_score_correction_bias.float()
