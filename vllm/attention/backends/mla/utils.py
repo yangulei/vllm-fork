@@ -170,13 +170,13 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         qk_rope_head_dim: int,
         qk_head_dim: int,
         v_head_dim: int,
-        rotary_emb: RotaryEmbedding,
+        rotary_emb: RotaryEmbedding = None,
         # q_proj should be q_b_proj if q_lora_rank is not None, but from an
         # attention backend perspective we rely on the layer to pass in the
         # correct matrix
-        q_proj: ColumnParallelLinear,
-        kv_b_proj: ColumnParallelLinear,
-        o_proj: RowParallelLinear,
+        q_proj: ColumnParallelLinear = None,
+        kv_b_proj: ColumnParallelLinear = None,
+        o_proj: RowParallelLinear = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
