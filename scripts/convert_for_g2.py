@@ -1,28 +1,43 @@
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+from glob import glob
+import os
 
-path="/data/DeepSeek-R1/model-00"
+# input_path = "/models/DeepSeek-R1-BF16-layer5-w8afp8-static"
+# output_path = "/models/DeepSeek-R1-BF16-layer5-w8afp8-static-G2"
+input_path = "/models/DeepSeek-R1-BF16-layer5-w8afp8-static-no-ste"
+output_path = "/models/DeepSeek-R1-BF16-layer5-w8afp8-static-no-ste-G2"
+input_path = "/models/DeepSeek-R1-BF16-w8afp8-static-no-ste"
+output_path = "/models/DeepSeek-R1-BF16-w8afp8-static-no-ste-G2"
 
-model_tail="-of-000163.safetensors"
+weight_factor = (
+    torch.finfo(torch.float8_e4m3fnuz).max / torch.finfo(torch.float8_e4m3fn).max
+)
+scale_factor = 1.0 / weight_factor
+scale_inv_factor = weight_factor
 
-out_path="/data/DeepSeek-R1-G2/model-00"
-
-for i in range(163):
-    idx = str(i + 1).zfill(3)
-    model_path = path + idx + model_tail
-    print("Path = " + str(model_path) + " conversion...")
+for safetensors_path in glob(f"{input_path}/*.safetensors"):
     tensors = {}
-    with safe_open(model_path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            if "proj" in k and "scale_inv" in k:
-                result = f.get_tensor(k) * 448.0 / 240.0
-            elif "proj" in k and not ("scale_inv" in k) and not ("eh_" in k):
-                result = (f.get_tensor(k).float() * 240.0 / 448.0).to(torch.float8_e4m3fn)
+    print(f"processing {safetensors_path}")
+    with safe_open(safetensors_path, framework="pt", device="cpu") as tensor_file:
+        for k in tensor_file.keys():
+            tensor = tensor_file.get_tensor(k)
+            # tensor = tensor.squeeze(-1)
+            if "proj" in k:
+                if k.endswith("weight"):
+                    tensor = (tensor.float() * weight_factor).to(torch.float8_e4m3fn)
+                elif k.endswith("weight_scale") or k.endswith("input_scale"):
+                    tensor = tensor.float() * scale_factor
+                elif k.endswith("weight_scale_inv") or k.endswith("input_scale_inv"):
+                    # "scale_inv" in deepseek-r1 is actually "scale"
+                    tensor = (tensor.float() * scale_factor)  
+                else:
+                    raise NotImplementedError(f"Cannot covert {k}")
             else:
-                result = f.get_tensor(k)
-            tensors.update({k : result})
-
-    output_path = out_path + idx + model_tail
-    save_file(tensors, output_path)
-
+                print(f"skip {k}.")
+            k = k.replace("input_scale_inv", "input_scale")
+            tensors[k] = tensor
+    new_tensor_path = safetensors_path.replace(input_path, output_path)
+    print(f"saving to {new_tensor_path}")
+    save_file(tensors, new_tensor_path)
