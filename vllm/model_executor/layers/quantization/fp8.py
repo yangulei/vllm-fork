@@ -889,7 +889,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         total_num_experts = router_logits.size(1)
         ep_shift = ep_rank * num_experts
 
-        use_static_moe = False
+        use_static_moe = True
         if use_static_moe:
             if self.block_quant:
                 orig_M_w13 = layer.orig_M_w13.data
