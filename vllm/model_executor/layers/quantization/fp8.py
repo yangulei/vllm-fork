@@ -889,7 +889,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         total_num_experts = router_logits.size(1)
         ep_shift = ep_rank * num_experts
 
-        use_static_moe = True
+        use_static_moe = False
         if use_static_moe:
             if self.block_quant:
                 orig_M_w13 = layer.orig_M_w13.data
@@ -1055,9 +1055,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w2_weight_scale_slice, n_expert_slice
                 )
 
-                # To ease fp8 qunat dynmaic MoE debugging
                 htorch.core.mark_step()
-                torch.hpu.synchronize()
 
                 current_states = torch.ops.hpu.mixture_of_experts(
                     hidden_states=x_fp8,
@@ -1097,8 +1095,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     final_hidden_states.add_(current_states)
         htorch.core.mark_step()
         torch.hpu.synchronize()
-        if torch.distributed.get_rank() == 0:
-            logger.info(f"Final hidden states range [{final_hidden_states.min().item()}, {final_hidden_states.max().item()}]")
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f"Final hidden states range [{final_hidden_states.min().item()}, {final_hidden_states.max().item()}]")
         return final_hidden_states.view(-1, x.shape[1])
 
 
