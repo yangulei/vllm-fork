@@ -161,8 +161,9 @@ case "$dtype" in
         echo Running with dtype="$dtype" ;;
     "fp8")
         echo Running with dtype="$dtype"
-        export QUANT_CONFIG=quantization/${model_name}/maxabs_quant_g2.json
-        QUANT_FLAGS=(--quantization inc --kv-cache-dtype fp8_inc)
+        # export QUANT_CONFIG=quantization/${model_name}/maxabs_quant_g2.json
+        # QUANT_FLAGS=(--quantization inc --kv-cache-dtype fp8_inc)
+        QUANT_FLAGS=(--kv-cache-dtype fp8_inc)
         dtype="bfloat16"
         ;;
     "awq")
