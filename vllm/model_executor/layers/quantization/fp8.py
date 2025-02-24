@@ -962,9 +962,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         bias=None,
                         accumulate=False,
                     )
-                    import habana_frameworks.torch as htorch
-                    htorch.core.mark_step()
-                    torch.hpu.synchronize()
                 d = up_gate_states.shape[-1] // 2
                 current_state_static = F.silu(up_gate_states[..., :d]) * up_gate_states[..., d:]
 
@@ -999,11 +996,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                         B_scale_inv=w2_weight_scale,
                                         bias=None,
                                         accumulate=False)
-                    import habana_frameworks.torch as htorch
-                    htorch.core.mark_step()
-                    torch.hpu.synchronize()
                 else:
                     raise ""
+                # To avoid OOM on Gaudi
+                htorch.core.mark_step()
+
                 padded_weight = padded_weights[idx + ep_shift].unsqueeze(1)
                 if idx == 0:
                     final_hidden_states = current_hidden_states * padded_weight
