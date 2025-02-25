@@ -429,7 +429,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias=bias,
                 )
             elif self.quant_config.activation_scheme == "static":
-                # TODO@yangulei: get it done
                 x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/layer.input_scale, False, False, torch.float8_e4m3fn)[0]
                 res = torch.ops.hpu.fp8_gemm_v2(
                     A=x_fp8,
@@ -442,9 +441,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     B_scale_inv=layer.weight_scale_inv,
                     bias=bias,
                     accumulate=False)
-                import habana_frameworks.torch as htorch
-                htorch.core.mark_step()
-                torch.hpu.synchronize()
                 return res
             else:
                 pass
