@@ -226,6 +226,7 @@ export VLLM_EP_SIZE=${VLLM_EP_SIZE:-"${num_hpu}"}
 export VLLM_MOE_N_SLICE=${VLLM_MOE_N_SLICE:-"4"}
 
 gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-"0.9"}
+max_seq_len_to_capture=${VLLM_MAX_SEQ_LEN_TO_CAPTURE:-"4096"}
 
 set_numactl
 set_bucketing
@@ -245,6 +246,7 @@ python "$BASH_DIR/../benchmarks/benchmark_throughput.py" \
     --max-num-seqs "${max_num_seqs}" \
     --max-num-batched-tokens "${max_num_batched_tokens}" \
     --max-model-len "${max_model_len}" \
+    --max-seq-len-to-capture "$max_seq_len_to_capture" \
     --num-prompts "${num_prompts}" \
     --disable-log-requests \
     --use-v2-block-manager \

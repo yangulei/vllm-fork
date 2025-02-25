@@ -670,6 +670,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.max_model_len = self.scheduler_config.max_model_len
         self.max_num_batched_tokens = \
             self.scheduler_config.max_num_batched_tokens
+        self.max_seq_len_to_capture = self.model_config.max_seq_len_to_capture
         self.block_size = self.cache_config.block_size
 
         self.pin_memory = is_pin_memory_available()
@@ -889,7 +890,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         return self.model
 
     def _use_graphs(self, batch_size, seq_len, is_prompt):
-        if is_prompt:
+        if is_prompt and batch_size * seq_len > self.max_seq_len_to_capture:
             return False
         if self.enforce_eager:
             return False
@@ -1902,7 +1903,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             # Graph memory usage is proportional to seq dimension in a batch
             batch_seq = batch_size * seq_len if is_prompt else batch_size
             mem_estimate = batch_seq / total_batch_seq * total_mem
-            if mem_estimate >= available_mem:
+            if mem_estimate >= available_mem or batch_seq > self.max_seq_len_to_capture:
                 captured_all = False
                 continue
             graphed_bucket = (batch_size, seq_len, is_prompt)
