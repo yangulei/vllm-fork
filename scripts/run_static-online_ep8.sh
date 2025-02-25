@@ -2,14 +2,16 @@
 tp_parrallel=8
 in_len=1024
 out_len=1024
+model_len=2048
 multi_step=1
 total_len=$((in_len + out_len))
-ep_size=4
+ep_size=8
 moe_n_slice=1
-gpu_utils=0.8
-bs=96
+gpu_utils=0.9
+bs=32
 num_prompts=96
-request_rate=96
+request_rate=inf
+ratio=1.0
 log_name="static-online-gaudi3-${gpu_utils}util-TPparallel${tp_parrallel}-EP${ep_size}-loop${moe_n_slice}moegroups-multistep${multi_step}_nprompt${num_prompts}_rrate${request_rate}_bs${bs}_i${in_len}_o${out_len}"
 
 VLLM_DECODE_BLOCK_BUCKET_MIN=$((in_len * bs / 128))
@@ -43,7 +45,7 @@ python -m vllm.entrypoints.openai.api_server \
     --dtype bfloat16 \
     --use-v2-block-manager \
     --num_scheduler_steps ${multi_step}\
-    --max-model-len 2048 \
+    --max-model-len ${model_len} \
     --distributed_executor_backend mp \
     --gpu_memory_utilization ${gpu_utils} \
     --trust_remote_code 2>&1 | tee benchmark_logs/${log_name}_serving.log &
@@ -65,7 +67,7 @@ hl_pid=$(($!-1))
 
 start_time=$(date +%s)
 echo "Start to benchmark"
-python benchmarks/benchmark_serving.py --backend vllm --model ${model} --tokenizer ${tokenizer} --dataset-name sonnet --dataset-path benchmarks/sonnet.txt --request-rate ${request_rate} --num-prompts ${num_prompts} --port 8080 --sonnet-input-len ${in_len} --sonnet-output-len ${out_len} --sonnet-prefix-len 100 2>&1 | tee benchmark_logs/${log_name}_run1.log
+python benchmarks/benchmark_serving.py --backend vllm --model ${model} --tokenizer ${tokenizer} --dataset-name sonnet --dataset-path benchmarks/sonnet.txt --request-rate ${request_rate} --max-concurrency ${bs} --num-prompts ${num_prompts} --port 8080 --sonnet-input-len ${in_len} --sonnet-output-len ${out_len} --sonnet-prefix-len 100 --random-range-ratio ${ratio} 2>&1 | tee benchmark_logs/${log_name}_run1.log
 end_time=$(date +%s)
 echo "Time elapsed: $((end_time - start_time))s"
 
