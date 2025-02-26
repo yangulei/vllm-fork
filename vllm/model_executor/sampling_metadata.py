@@ -611,6 +611,8 @@ class SamplingTensors:
         # Because the memory is pinned, we can do non-blocking
         # transfer to device.
 
+        if current_platform.is_hpu():
+            torch.hpu.synchronize()
         return cls(
             temperatures=temperatures_t.to(device=device, non_blocking=True),
             top_ps=top_ps_t.to(device=device, non_blocking=True),
