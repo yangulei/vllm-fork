@@ -1,6 +1,8 @@
 import os
 import json
 import torch
+from compress_pickle import load
+
 
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -9,8 +11,15 @@ from safetensors.torch import save_file
 SAFETENSORS = "safetensors"
 WEIGHT_SCALE_NAME = "weight_scale_inv"
 MODEL_STATE_DICT_MAPPING_FILENAME = "model.safetensors.index.json"
+FULL_RANGE = 240.0  # torch.finfo(torch.float8_e4m3fnuz).max for Gaudi2
 # end constants
 
+def get_input_scales(pkl_path):
+    input_scales = {}
+    if pkl_path is not None:
+        with open(pkl_path, 'rb') as file:
+            input_scales = load(file)
+    return input_scales
 
 def maybe_create_dir(qmodel_path):
     os.makedirs(qmodel_path, exist_ok=True)
@@ -83,20 +92,22 @@ def dequant_block_fp8_weight_naive(weight, weight_scale, block_size, dtype, orig
 
 
 def dynamic_quant(data):
-    scale = ((torch.abs(data)).max(dim=1).values + 1e-8) / 240.0  # torch.finfo(torch.float8_e4m3fn).max
+    scale = (torch.abs(data)).max(dim=1).values / FULL_RANGE
     scale = scale.unsqueeze(-1)
     data = data / scale
     data_fp8 = data.to(torch.float8_e4m3fn)
     return data_fp8, scale.float()
 
 
-def main(model_path: str, qmodel_path: str) -> None:
+def main(model_path: str, qmodel_path: str, input_scales_path: str) -> None:
     torch.set_grad_enabled(False)
     maybe_create_dir(qmodel_path)
     all_weight_filename = sorted(get_all_weight_filename(model_path))
     print(f"Got {len(all_weight_filename)} weight files")
     qtensor_mapping = {}
     weight_map = json.load(open(f"{model_path}/{MODEL_STATE_DICT_MAPPING_FILENAME}"))["weight_map"]
+
+    input_scales = get_input_scales(input_scales_path)
 
     for i, filename in enumerate(all_weight_filename):
         print(f"Processing {i + 1}/{len(all_weight_filename)}: {filename}")
@@ -107,13 +118,16 @@ def main(model_path: str, qmodel_path: str) -> None:
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 print(f"[{i+1}/{len(all_weight_filename)}] Processing {name}")
-                if "proj" in name and "scale_inv" in name:
-                    scale_name = name
+                if "model.layers.61" in name:
+                    print(f"Ignoring {name}")
+                    continue
+                elif "proj" in name and "scale_inv" in name:
+                    weight_scale_name = name
                     weight_name = name[: -len("_scale_inv")]
-                    print(f"Begin quantizing weight: {weight_name} with scale: {scale_name}")
+                    print(f"Begin quantizing weight: {weight_name} with scale: {weight_scale_name}")
 
                     scale = f.get_tensor(name)
-                    scale_file = weight_map.get(scale_name)
+                    scale_file = weight_map.get(weight_scale_name)
                     weight_file = weight_map.get(weight_name)
                     if scale_file != weight_file:
                         with safe_open(os.path.join(model_path, weight_file), framework="pt", device="cpu") as wf:
@@ -125,11 +139,20 @@ def main(model_path: str, qmodel_path: str) -> None:
                     weight, orig_M, orig_N = pad_block_fp8_weight_naive(weight, scale, block_size)
                     deq_weights = dequant_block_fp8_weight_naive(weight, scale, block_size, torch.float32, orig_M, orig_N)
                     qtensor, scale = dynamic_quant(deq_weights)
-                    qtensors[scale_name] = scale.squeeze(1)
+                    qtensors[weight_scale_name] = scale.squeeze(1)
                     qtensors[weight_name] = qtensor
-                    qtensor_mapping[scale_name] = filename
+                    qtensor_mapping[weight_scale_name] = filename
                     qtensor_mapping[weight_name] = filename
-                    print(f"Completed quantizing weight: {weight_name} with scale: {scale_name}")
+
+                    input_scale_name = weight_scale_name.replace("weight_scale_inv", "input_scale_inv")
+                    if input_scale_name in input_scales.keys():
+                        input_scale = input_scales.pop(input_scale_name)
+                        input_scale = input_scale * 448.0 / FULL_RANGE
+                        input_scale_name = input_scale_name.replace("input_scale_inv", "input_scale")
+                        qtensors[input_scale_name] = input_scale
+                        qtensor_mapping[input_scale_name] = filename
+                    
+                    print(f"Completed quantizing weight: {weight_name} with scale: {weight_scale_name}")
                 elif "proj" in name and not ("scale_inv" in name) and not ("eh_" in name):
                     print(f"Ignoring {name}")
                     continue
@@ -142,6 +165,10 @@ def main(model_path: str, qmodel_path: str) -> None:
 
         print(f"[{i+1}/{len(all_weight_filename)}] Saving {len(qtensors)} tensors to {qmodel_file_path}")
         save_file(qtensors, qmodel_file_path)
+    if input_scales.keys():
+        print(f"warning: the following input_scales are unused:")
+        for k in input_scales.keys():
+            print(k)
 
     model_state_dict_mapping_file_path = os.path.join(qmodel_path, MODEL_STATE_DICT_MAPPING_FILENAME)
     print(f"Saving tensor mapping to {model_state_dict_mapping_file_path}")
@@ -159,5 +186,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--qmodel_path", type=str, required=True)
+    parser.add_argument("--input_scales_path", type=str, default=None)
     args = parser.parse_args()
-    main(args.model_path, args.qmodel_path)
+    main(args.model_path, args.qmodel_path, args.input_scales_path)
