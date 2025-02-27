@@ -743,6 +743,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         w2_input_scale, requires_grad=False)
 
             if current_platform.is_hpu():
+                if self.quant_config.activation_scheme == "static":
+                    num_experts = layer.w13_weight.shape[0]
+                    self.w13_weight_list = [layer.w13_weight.data[i,...] for i in range(num_experts)]
+                    self.w2_weight_list = [layer.w2_weight.data[i,...] for i in range(num_experts)]
+                    self.w13_weight_scale_list = [layer.w13_weight_scale_inv.data[i,...] for i in range(num_experts)]
+                    self.w2_weight_scale_list = [layer.w2_weight_scale_inv.data[i,...] for i in range(num_experts)]
+                    self.w2_input_scale_list = [layer.w2_input_scale.data.unsqueeze(0).repeat(num_experts)[i] for i in range(num_experts)]
                 return
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
@@ -889,24 +896,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             x_scale = layer.w13_input_scale.data
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
 
-            w13_weight = [layer.w13_weight.data[i,...] for i in range(num_experts)]
-            w2_weight = [layer.w2_weight.data[i,...] for i in range(num_experts)]
-            w13_weight_scale = [layer.w13_weight_scale_inv.data[i,...] for i in range(num_experts)]
-            w2_weight_scale = [layer.w2_weight_scale_inv.data[i,...] for i in range(num_experts)]
-            w2_input_scale = [layer.w2_input_scale.data.unsqueeze(0).repeat(num_experts)[i] for i in range(num_experts)]
-
             final_hidden_states = torch.ops.hpu.mixture_of_experts(
                 hidden_states=x_fp8,
                 expert_routing_table=(
                     topk_ids.to(torch.int64) - ep_shift
                 ),
                 router_weights=topk_weights.to(x.dtype),
-                w12=w13_weight,
-                w3=w2_weight,
+                w12=self.w13_weight_list,
+                w3=self.w2_weight_list,
                 d_scale_hidden_states=x_scale,
-                d_scale_intermediate_hidden_states=w2_input_scale,
-                d_scale_w12=w13_weight_scale,
-                d_scale_w3=w2_weight_scale,
+                d_scale_intermediate_hidden_states=self.w2_input_scale_list,
+                d_scale_w12=self.w13_weight_scale_list,
+                d_scale_w3=self.w2_weight_scale_list,
                 permuted_weights=True,
                 activation="silu",
                 experts_min=0,
