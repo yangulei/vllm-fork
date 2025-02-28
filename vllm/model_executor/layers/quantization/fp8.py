@@ -472,7 +472,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
-        self.moe_slice_length = int(os.environ.get("VLLM_MOE_SLICE_LENGTH", 8192))
+        self.moe_slice_length = int(os.environ.get("VLLM_MOE_SLICE_LENGTH", 12288))
 
     def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int,
@@ -893,19 +893,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ep_shift = ep_rank * num_experts
 
         if self.quant_config.activation_scheme == "static":
-            n_slice = (bt + self.moe_slice_length - 1) // self.moe_slice_length
             x_scale = layer.w13_input_scale.data
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
             selected_experts = topk_ids - ep_shift
 
-            final_hidden_states_list = []
-            for i in range(n_slice):
-                s = i * self.moe_slice_length
-                e = bt if i == (n_slice - 1) else (i + 1) * self.moe_slice_length
-                current_hidden_states = torch.ops.hpu.mixture_of_experts(
-                    hidden_states=x_fp8[s:e, ...],
-                    expert_routing_table=selected_experts[s:e, ...],
-                    router_weights=topk_weights[s:e, ...],
+            if seq_len > self.moe_slice_length:
+                final_hidden_states_list = []
+                n_slice = (bt + self.moe_slice_length - 1) // self.moe_slice_length
+                for i in range(n_slice):
+                    s = i * self.moe_slice_length
+                    e = bt if i == (n_slice - 1) else (i + 1) * self.moe_slice_length
+                    current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                        hidden_states=x_fp8[s:e, ...],
+                        expert_routing_table=selected_experts[s:e, ...],
+                        router_weights=topk_weights[s:e, ...],
+                        w12=self.w13_weight_list,
+                        w3=self.w2_weight_list,
+                        d_scale_hidden_states=x_scale,
+                        d_scale_intermediate_hidden_states=self.w2_input_scale_list,
+                        d_scale_w12=self.w13_weight_scale_list,
+                        d_scale_w3=self.w2_weight_scale_list,
+                        permuted_weights=True,
+                        activation="silu",
+                        experts_min=0,
+                        experts_max=(num_experts - 1),
+                    )
+                    final_hidden_states_list.append(current_hidden_states)
+                final_hidden_states = torch.cat(final_hidden_states_list, dim = 0)
+            else:
+                final_hidden_states = torch.ops.hpu.mixture_of_experts(
+                    hidden_states=x_fp8,
+                    expert_routing_table=selected_experts,
+                    router_weights=topk_weights,
                     w12=self.w13_weight_list,
                     w3=self.w2_weight_list,
                     d_scale_hidden_states=x_scale,
@@ -917,8 +936,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     experts_min=0,
                     experts_max=(num_experts - 1),
                 )
-                final_hidden_states_list.append(current_hidden_states)
-            final_hidden_states = torch.cat(final_hidden_states_list, dim = 0)
             return final_hidden_states.view(-1, x.shape[1])
 
         if self.block_quant:
