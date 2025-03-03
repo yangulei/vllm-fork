@@ -897,7 +897,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
             selected_experts = topk_ids - ep_shift
 
-            if seq_len > self.moe_slice_length:
+            if bt > self.moe_slice_length:
                 final_hidden_states_list = []
                 n_slice = (bt + self.moe_slice_length - 1) // self.moe_slice_length
                 for i in range(n_slice):
