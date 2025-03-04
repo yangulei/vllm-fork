@@ -134,6 +134,10 @@ def dynamic_quant(data):
 #    data_fp8 = data.to(torch.float8_e4m3fn)
     return data_fp8, scale.float()
 
+def dynamic_quant_per_tensor(data):
+    scale = ((torch.abs(data)).max() + 1e-8) / 240.0 #torch.finfo(torch.float8_e4m3fn).max
+    data_fp8 = torch.ops.hpu.cast_to_fp8_v2(data, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
+    return data_fp8, scale.float()
 
 def dequant_block_fp8_weight_naive(weight, weight_scale, block_size, dtype, original_M, original_N):
 
