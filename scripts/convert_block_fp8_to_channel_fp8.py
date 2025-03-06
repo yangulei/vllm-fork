@@ -11,7 +11,6 @@ from safetensors.torch import save_file
 SAFETENSORS = "safetensors"
 WEIGHT_SCALE_NAME = "weight_scale_inv"
 MODEL_STATE_DICT_MAPPING_FILENAME = "model.safetensors.index.json"
-FULL_RANGE = 240.0  # torch.finfo(torch.float8_e4m3fnuz).max for Gaudi2
 # end constants
 
 def get_input_scales(pkl_path):
@@ -186,6 +185,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--qmodel_path", type=str, required=True)
+    parser.add_argument("--full_range", type=float, default=448.0)
     parser.add_argument("--input_scales_path", type=str, default=None)
     args = parser.parse_args()
+
+    FULL_RANGE = args.full_range
+    print(f"Using full range: {FULL_RANGE}")
     main(args.model_path, args.qmodel_path, args.input_scales_path)
