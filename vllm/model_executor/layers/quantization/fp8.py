@@ -467,7 +467,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         self.moe_slice_length = int(os.environ.get("VLLM_MOE_SLICE_LENGTH", 12288))
-
+        self.mask_weights_buffer = None
+        self.padded_weights_buffer = None
+        self.bt_threshold = int(os.environ.get('VLLM_MAX_SEQ_LEN_TO_CAPTURE', 8192))
     def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
@@ -986,13 +988,50 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.quant_config.activation_scheme == "dynamic" and not self.block_quant:
             x_fp8, x_scale = dynamic_quant(x)
 
-        padded_weights = torch.zeros((bt, total_num_experts), dtype=x.dtype, device=x.device)
+        htorch.core.mark_step()
+        if (self.padded_weights_buffer is None
+                or self.padded_weights_buffer.dtype != x.dtype
+                or self.padded_weights_buffer.device != x.device
+                or self.padded_weights_buffer.shape[0] < bt
+                or self.padded_weights_buffer.shape[1] < total_num_experts
+        ):
+            if (bt > self.bt_threshold):
+                padded_weights = torch.zeros((bt, total_num_experts), dtype=x.dtype, device=x.device)
+                if (self.padded_weights_buffer is None
+                        and self.bt_threshold != 0):
+                    self.padded_weights_buffer = torch.zeros((self.bt_threshold, total_num_experts), dtype=x.dtype, device=x.device)
+            else:
+                self.padded_weights_buffer = torch.zeros((bt, total_num_experts), dtype=x.dtype, device=x.device)
+                padded_weights = self.padded_weights_buffer
+        else:
+            self.padded_weights_buffer.zero_()
+            padded_weights = self.padded_weights_buffer
+
         padded_weights.scatter_(-1, topk_ids, topk_weights)
+        padded_weights = padded_weights[:bt, :total_num_experts]
         padded_weights = padded_weights.transpose(0, 1)
 
         if seq_len > 1:
-            mask_weights = torch.zeros((bt, total_num_experts), dtype=x.dtype, device=x.device)
+            if (self.mask_weights_buffer is None
+                or self.mask_weights_buffer.dtype != x.dtype
+                or self.mask_weights_buffer.device != x.device
+                or self.mask_weights_buffer.shape[0] < bt
+                or self.mask_weights_buffer.shape[1] < total_num_experts
+            ):
+                if (bt > self.bt_threshold):
+                    mask_weights = torch.zeros((bt, total_num_experts), dtype=x.dtype, device=x.device)
+                    if (self.mask_weights_buffer is None
+                            and self.bt_threshold != 0):
+                        self.mask_weights_buffer = torch.zeros((self.bt_threshold, total_num_experts), dtype=x.dtype, device=x.device)
+                else:
+                    self.mask_weights_buffer = torch.zeros((bt, total_num_experts), dtype=x.dtype, device=x.device)
+                    mask_weights = self.mask_weights_buffer
+            else:
+                self.mask_weights_buffer.zero_()
+                mask_weights = self.mask_weights_buffer
+
             mask_weights.scatter_(-1, topk_ids, 1)
+            mask_weights = mask_weights[:bt, :total_num_experts]
             mask_weights = mask_weights.transpose(0, 1)
 
         for idx in range(num_experts):
