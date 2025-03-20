@@ -2,8 +2,8 @@
 
 pip install compress_pickle
 
-original_model_path=/models/DeepSeek-R1
-output_model_root=/models
+original_model_path=${ORIGINAL_MODEL_PATH:-/models/DeepSeek-R1}
+output_model_root=${OUTPUT_MODEL_ROOT:-/models}
 input_scales_path=DeepSeek-R1-BF16-w8afp8-static-no-ste_input_scale_inv.pkl.gz
 
 device=$(hl-smi -Q name -f csv | tail -n 1)
