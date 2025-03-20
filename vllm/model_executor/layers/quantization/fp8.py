@@ -988,7 +988,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.quant_config.activation_scheme == "dynamic" and not self.block_quant:
             x_fp8, x_scale = dynamic_quant(x)
 
-        htorch.core.mark_step()
+        if torch._dynamo.is_compiling():
+            torch._dynamo.graph_break()
+        else:
+            htorch.core.mark_step()
+
         if (self.padded_weights_buffer is None
                 or self.padded_weights_buffer.dtype != x.dtype
                 or self.padded_weights_buffer.device != x.device
