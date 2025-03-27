@@ -1,6 +1,6 @@
 #! /bin/bash
 
-pip install compress_pickle
+pip install compress_pickle torch safetensors numpy --extra-index-url https://download.pytorch.org/whl/cpu
 
 original_model_path=${ORIGINAL_MODEL_PATH:-/models/DeepSeek-R1}
 output_model_root=${OUTPUT_MODEL_ROOT:-/models}
