@@ -86,30 +86,33 @@ class HPUMLAAttentionBackend(HPUAttentionBackend):
     def get_name() -> str:
         return "HPU_MLA"
 
-def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
+def flat_pa_mla(q_nope, q_pe, key_cache, value_cache, block_list, block_mapping,
             block_bias, block_scales, block_groups, scale, matmul_qk_op,
             matmul_av_op, batch2block_matmul_op, block2batch_matmul_op,
             keys_fetch_func, values_fetch_func):
-    batch_size = query.size(0)
-    q_heads = query.size(1)
+    batch_size = q_nope.size(0)
+    q_heads = q_nope.size(1)
     kv_heads = key_cache.size(2)
 
-    query = ops.batch2block(scale * query, block_mapping, batch2block_matmul_op).unsqueeze(-2)
+    q_nope = ops.batch2block(scale * q_nope, block_mapping, batch2block_matmul_op).unsqueeze(-2)
+    q_pe = ops.batch2block(scale * q_pe, block_mapping, batch2block_matmul_op).unsqueeze(-2)
     key = keys_fetch_func(key_cache, block_list).transpose(1, 2)
     value = values_fetch_func(value_cache, block_list).transpose(1, 2)
-    # get concat key
-    key = torch.concat((value, key), dim=-1)
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
     if kv_heads != q_heads:
         block_bias = block_bias.unsqueeze(1)
-        query = query.unflatten(1, (kv_heads, -1))
+        q_nope = q_nope.unflatten(1, (kv_heads, -1))
+        q_pe = q_pe.unflatten(1, (kv_heads, -1))
         key = key.unflatten(1, (kv_heads, 1))
         value = value.unflatten(1, (kv_heads, 1))
         key = key.transpose(3, 4)
     else:
         key = key.transpose(2, 3)
 
-    attn = matmul_qk_op(query, key)
+    qk_nope = matmul_qk_op(q_nope, value.transpose(3, 4))
+    qk_pe = matmul_qk_op(q_pe, key)
+    attn = qk_nope + qk_pe
+
     if 'fp32_softmax' in enabled_flags():
         attn = attn.float()
         import habana_frameworks.torch.core as htcore
@@ -321,12 +324,12 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         attn_metadata: HPUAttentionMetadata,
         batch_size: int
     ) -> torch.Tensor:
-        q = torch.cat([q_nope, q_pe], dim=-1)
         kv_c_and_k_pe_cache = kv_cache[0].unsqueeze(2)
         kv_c_cache = kv_cache[1].unsqueeze(2)
 
         output = flat_pa_mla(
-            query=q,
+            q_nope=q_nope,
+            q_pe=q_pe,
             key_cache=kv_c_and_k_pe_cache,
             value_cache=kv_c_cache,
             block_list=attn_metadata.block_list,
