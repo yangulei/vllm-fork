@@ -993,14 +993,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             experts_max=(num_experts - 1),
                         )
                     else:
-                        htorch.core.mark_step()
                         current_hidden_states = torch.ops.hpu.mixture_of_experts(
                             hidden_states=x_fp8[s:e, ...],
                             expert_routing_table=selected_experts[s:e, ...],
                             router_weights=topk_weights[s:e, ...],
                             w12=self.w13_weight_list,
                             w3=self.w2_weight_list,
-                            d_scale_hidden_states=x_scale,
+                            d_scale_hidden_states=x_scale[s:e, ...],
                             d_scale_w12=self.w13_weight_scale_list,
                             d_scale_w3=self.w2_weight_scale_list,
                             permuted_weights=True,
@@ -1008,7 +1007,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             experts_min=0,
                             experts_max=(num_experts - 1),
                         )
-                        htorch.core.mark_step()
                     final_hidden_states_list.append(current_hidden_states)
                 final_hidden_states = torch.cat(final_hidden_states_list,
                                                 dim=0)
