@@ -475,6 +475,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = self.quant_config.weight_block_size is not None
         self.mask_weights_buffer = None
         self.padded_weights_buffer = None
+        self.moe_slice_length = int(
+            os.environ.get("VLLM_MOE_SLICE_LENGTH", 4096))
         self.bt_threshold = int(
             os.environ.get('VLLM_MAX_SEQ_LEN_TO_CAPTURE', 8192))
 
@@ -960,39 +962,88 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                                      False,
                                                      torch.float8_e4m3fn)[0]
                 scale_intermediate = self.w2_input_scale_list
-
-                final_hidden_states = torch.ops.hpu.mixture_of_experts(
-                    hidden_states=x_fp8,
-                    expert_routing_table=(topk_ids - ep_shift),
-                    router_weights=topk_weights,
-                    w12=self.w13_weight_list,
-                    w3=self.w2_weight_list,
-                    d_scale_hidden_states=x_scale,
-                    d_scale_intermediate_hidden_states=scale_intermediate,
-                    d_scale_w12=self.w13_weight_scale_list,
-                    d_scale_w3=self.w2_weight_scale_list,
-                    permuted_weights=True,
-                    activation="silu",
-                    experts_min=0,
-                    experts_max=(num_experts - 1),
-                )
             else:
                 x_fp8, x_scale = dynamic_quant(x)
+                x_scale = x_scale.squeeze(-1)
 
-                final_hidden_states = torch.ops.hpu.mixture_of_experts(
-                    hidden_states=x_fp8,
-                    expert_routing_table=(topk_ids - ep_shift),
-                    router_weights=topk_weights,
-                    w12=self.w13_weight_list,
-                    w3=self.w2_weight_list,
-                    d_scale_hidden_states=x_scale.squeeze(-1),
-                    d_scale_w12=self.w13_weight_scale_list,
-                    d_scale_w3=self.w2_weight_scale_list,
-                    permuted_weights=True,
-                    activation="silu",
-                    experts_min=0,
-                    experts_max=(num_experts - 1),
-                )
+            selected_experts = topk_ids - ep_shift
+
+            if bt > self.moe_slice_length:
+                final_hidden_states_list = []
+                n_slice = (bt + self.moe_slice_length -
+                           1) // self.moe_slice_length
+                for i in range(n_slice):
+                    s = i * self.moe_slice_length
+                    e = bt if i == (n_slice -
+                                    1) else (i + 1) * self.moe_slice_length
+                    if self.quant_config.activation_scheme == "static":
+                        current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                            hidden_states=x_fp8[s:e, ...],
+                            expert_routing_table=selected_experts[s:e, ...],
+                            router_weights=topk_weights[s:e, ...],
+                            w12=self.w13_weight_list,
+                            w3=self.w2_weight_list,
+                            d_scale_hidden_states=x_scale,
+                            d_scale_intermediate_hidden_states=scale_intermediate,
+                            d_scale_w12=self.w13_weight_scale_list,
+                            d_scale_w3=self.w2_weight_scale_list,
+                            permuted_weights=True,
+                            activation="silu",
+                            experts_min=0,
+                            experts_max=(num_experts - 1),
+                        )
+                    else:
+                        htorch.core.mark_step()
+                        current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                            hidden_states=x_fp8[s:e, ...],
+                            expert_routing_table=selected_experts[s:e, ...],
+                            router_weights=topk_weights[s:e, ...],
+                            w12=self.w13_weight_list,
+                            w3=self.w2_weight_list,
+                            d_scale_hidden_states=x_scale,
+                            d_scale_w12=self.w13_weight_scale_list,
+                            d_scale_w3=self.w2_weight_scale_list,
+                            permuted_weights=True,
+                            activation="silu",
+                            experts_min=0,
+                            experts_max=(num_experts - 1),
+                        )
+                        htorch.core.mark_step()
+                    final_hidden_states_list.append(current_hidden_states)
+                final_hidden_states = torch.cat(final_hidden_states_list,
+                                                dim=0)
+            else:
+                if self.quant_config.activation_scheme == "static":
+                    final_hidden_states = torch.ops.hpu.mixture_of_experts(
+                        hidden_states=x_fp8,
+                        expert_routing_table=selected_experts,
+                        router_weights=topk_weights,
+                        w12=self.w13_weight_list,
+                        w3=self.w2_weight_list,
+                        d_scale_hidden_states=x_scale,
+                        d_scale_intermediate_hidden_states=scale_intermediate,
+                        d_scale_w12=self.w13_weight_scale_list,
+                        d_scale_w3=self.w2_weight_scale_list,
+                        permuted_weights=True,
+                        activation="silu",
+                        experts_min=0,
+                        experts_max=(num_experts - 1),
+                    )
+                else:
+                    final_hidden_states = torch.ops.hpu.mixture_of_experts(
+                        hidden_states=x_fp8,
+                        expert_routing_table=selected_experts,
+                        router_weights=topk_weights,
+                        w12=self.w13_weight_list,
+                        w3=self.w2_weight_list,
+                        d_scale_hidden_states=x_scale,
+                        d_scale_w12=self.w13_weight_scale_list,
+                        d_scale_w3=self.w2_weight_scale_list,
+                        permuted_weights=True,
+                        activation="silu",
+                        experts_min=0,
+                        experts_max=(num_experts - 1),
+                    )
 
             return final_hidden_states.view(-1, x.shape[1])
 
