@@ -476,7 +476,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.mask_weights_buffer = None
         self.padded_weights_buffer = None
         self.moe_slice_length = int(
-            os.environ.get("VLLM_MOE_SLICE_LENGTH", 4096))
+            os.environ.get("VLLM_MOE_SLICE_LENGTH", 8192))
         self.bt_threshold = int(
             os.environ.get('VLLM_MAX_SEQ_LEN_TO_CAPTURE', 8192))
 
