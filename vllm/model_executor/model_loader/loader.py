@@ -443,6 +443,14 @@ class DefaultModelLoader(BaseModelLoader):
             from neural_compressor.torch.algorithms.fp8_quant.model_configs import ModuleExtraConfig, ModuleConfig
             from neural_compressor.torch.algorithms.fp8_quant._core.quant_dequant import QuantInput, DequantOutput
             from neural_compressor.torch.algorithms.fp8_quant.common import generate_model_info
+            try:
+                from neural_compressor.torch.algorithms.fp8_quant._core.quantized_func_wrappers import (
+                    init_quantized_func_wrapper_factory,
+                )
+                init_quantized_func_wrapper_factory()
+            except ImportError:
+                logger.warning("Skip init quantized_func wrapper factory")
+                pass
             parent_child_mod_dict = generate_model_info(model)
 
             def forward_quant(self, input, *args, **kwargs):
