@@ -2436,8 +2436,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
         max_batch_size = min(self.max_num_seqs,
                              self.max_num_batched_tokens // max_seq_len)
+        max_batch_size = max(max_batch_size, 1)
         # Using batch_size 1 is profile multimodal models
         max_batch_size = max_batch_size if not self.model_is_mrope else 1
+        logger.info(
+            "Running profile run with max_batch_size=%d, max_seq_len=%d",
+            max_batch_size, max_seq_len)
         self.warmup_scenario(
             batch_size=max_batch_size,
             seq_len=max_seq_len,
