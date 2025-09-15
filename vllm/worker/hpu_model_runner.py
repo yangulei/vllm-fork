@@ -26,6 +26,7 @@ import torch.nn as nn
 import vllm_hpu_extension.environment as environment
 from vllm_hpu_extension.bucketing import HPUBucketingContext
 from vllm_hpu_extension.flags import enabled_flags
+from vllm_hpu_extension.bucketing.common import HPUBucketingManager
 from vllm_hpu_extension.ops import LoraMask as LoraMask
 from vllm_hpu_extension.ops import batch2block, block2batch
 from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
@@ -765,10 +766,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.profiler_counter_helper = HabanaProfilerCounterHelper()
         self.seen_configs: set = set()
         self._mem_margin: Optional[int] = None
-        self.bucketing_ctx = HPUBucketingContext(self.max_num_seqs,
-                                                 self.max_num_prefill_seqs,
-                                                 self.block_size,
-                                                 self.max_num_batched_tokens)
+        self.bucketing_manager = HPUBucketingManager()
+        self.bucketing_manager.initialize(
+            max_num_seqs=self.max_num_seqs,
+            max_num_prefill_seqs=self.max_num_prefill_seqs,
+            block_size=self.block_size,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_model_len=self.max_model_len)
         self.graphed_buckets: Set[Any] = set()
 
         # Data Parallel
@@ -972,8 +976,16 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                        is_prompt,
                        align_worker=False):
         real_batch_size = len(seq_group_metadata_list)
-        batch_size_padded = self.bucketing_ctx.get_padded_batch_size(
-            real_batch_size, is_prompt)
+        if is_prompt:
+            first_key = next(iter(seq_group_metadata_list[0].seq_data))
+            seq_len = len(seq_group_metadata_list[0].seq_data[first_key].
+                          prompt_token_ids)
+            batch_size_padded = self.bucketing_manager.find_prompt_bucket(
+                real_batch_size, seq_len, 0)[0]
+        else:
+            batch_size_padded = self.bucketing_manager.find_decode_bucket(
+                real_batch_size, 0)[0]
+
         if self.dp_awared_padding and (
             self.kv_conf is None or not is_prompt or not self.kv_conf.is_kv_consumer
         ):
@@ -1198,7 +1210,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         assert max_query_len > 0
 
         max_prompt_len = max(
-            self.bucketing_ctx.get_padded_prompt_seq_len(max_query_len),
+            self.bucketing_manager.get_max_prompt_shape(),
             self.block_size)
 
         if self.dp_awared_padding and\
@@ -1474,8 +1486,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         padding_fn = None
         if self.use_contiguous_pa:
             block_bucket_size = max(max(block_list) + 1, len(block_list))
-            block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
-                block_bucket_size)
+            block_bucket_size = self.bucketing_manager.find_decode_bucket(
+                len(seq_group_metadata_list), block_bucket_size)[2]
             if self.dp_awared_padding:
                 if self.is_driver_worker:
                     block_bucket_size = align_dp_groups(
@@ -1490,8 +1502,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             padding_fn = lambda tensor, pad_value: gather_list(
                 tensor, indices, pad_value)
         else:
-            block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
-                len(block_list))
+            block_bucket_size = self.bucketing_manager.find_decode_bucket(
+                len(block_list), 0)[2]
             if self.dp_awared_padding:
                 if self.is_driver_worker:
                     block_bucket_size = align_dp_groups(
