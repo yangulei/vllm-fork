@@ -275,6 +275,9 @@ class TransformersModel(nn.Module):
 
         tp_plan = self.model._tp_plan
 
+        if tp_plan is None:
+            return
+
         def _tensor_parallel(module: nn.Module, prefix: str = ""):
             for child_name, child_module in module.named_children():
                 qual_name = maybe_prefix(prefix, child_name)

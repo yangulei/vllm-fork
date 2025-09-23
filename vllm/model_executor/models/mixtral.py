@@ -363,6 +363,7 @@ class MixtralModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            torch.hpu.synchronize()
             if (self.quant_config is not None and
                 (scale_name := self.quant_config.get_cache_scale(name))):
                 # Loading kv cache quantization scales

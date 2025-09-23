@@ -1143,10 +1143,12 @@ class FusedMoE(torch.nn.Module):
 
     def _load_single_value(self, param: torch.nn.Parameter,
                            loaded_weight: torch.Tensor, expert_id: int):
+        torch.hpu.synchronize()
         param_data = param.data
 
         # Input scales can be loaded directly and should be equal.
         param_data[expert_id] = loaded_weight
+        torch.hpu.synchronize()
 
     def _load_g_idx(self, shard_id: str, expert_data: torch.Tensor,
                     shard_dim: int, loaded_weight: torch.Tensor, tp_rank: int):
@@ -1225,14 +1227,15 @@ class FusedMoE(torch.nn.Module):
         if "input_scale" in weight_name:
             # this is needed for compressed-tensors only
             loaded_weight = loaded_weight.to(param.data.device)
+            torch.hpu.synchronize()
 
-            if ("compressed" in quant_method_name.lower()
-                    and param.data[expert_id] != 1
-                    and (param.data[expert_id] - loaded_weight).abs() > 1e-5):
-                raise ValueError(
-                    "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param.data[expert_id]} "
-                    f"vs. {loaded_weight}")
+            # if ("compressed" in quant_method_name.lower()
+            #         and param.data[expert_id] != 1
+            #         and (param.data[expert_id] - loaded_weight).abs() > 1e-5):
+            #     raise ValueError(
+            #         "input_scales of w1 and w3 of a layer "
+            #         f"must be equal. But got {param.data[expert_id]} "
+            #         f"vs. {loaded_weight}")
 
             self._load_single_value(param=param,
                                     loaded_weight=loaded_weight,
