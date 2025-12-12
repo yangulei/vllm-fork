@@ -9,6 +9,8 @@ import cloudpickle
 import zmq
 
 from vllm import AsyncEngineArgs, SamplingParams
+from vllm.distributed import (destroy_distributed_environment,
+                              destroy_model_parallel)
 from vllm.engine.llm_engine import LLMEngine
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -148,6 +150,13 @@ class MQLLMEngine:
         """Cleanup zeromq state on shutdown."""
         # Closes all sockets and destroys context.
         self.ctx.destroy(linger=0)
+        self.engine.shutdown()
+
+        # Cleanup the pytorch distributed groups
+        logger.info("Cleanup parallel environments...")
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
         del self.engine
 
     @contextmanager
@@ -379,7 +388,15 @@ class MQLLMEngine:
         return self.engine.reset_prefix_cache()
 
 
+mp_engine_terminated = False
+
+
 def signal_handler(*_) -> None:
+    global mp_engine_terminated
+    if mp_engine_terminated:
+        logger.info("MQLLMEngine is already in progress of terminating.")
+        return
+    mp_engine_terminated = True
     raise KeyboardInterrupt("MQLLMEngine terminated")
 
 

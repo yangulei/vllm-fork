@@ -96,13 +96,20 @@ class MooncakeStore(KVLookupBufferBase):
             self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded successfully.")
 
-            self.store.setup(self.config.local_hostname,
-                             self.config.metadata_server,
-                             self.config.global_segment_size,
-                             self.config.local_buffer_size,
-                             self.config.protocol, self.config.device_name,
-                             self.config.master_server_address)
-
+            result = self.store.setup(
+                self.config.local_hostname,
+                self.config.metadata_server,
+                self.config.global_segment_size,
+                self.config.local_buffer_size,
+                self.config.protocol,
+                self.config.device_name,
+                self.config.master_server_address)
+            if result != 0:
+                error_msg = ("Failed to setup Mooncake store. "
+                             f"ErrorCode: {result}. "
+                             "Please make sure Mooncake master is "
+                             "running and check the configuration.")
+                raise RuntimeError(error_msg)
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -134,9 +141,13 @@ class MooncakeStore(KVLookupBufferBase):
         raise NotImplementedError
 
     def close(self):
-        # MooncakeDistributedStore will automatically call the destructor, so
-        # it is unnecessary to close it manually.
-        pass
+        # MooncakeDistributedStore will close automatically in the following cases:
+        # 1. SIGINT, SIGTERM and SIGHUP are sent and there is no other signal handler
+        # 2. Normal exit
+        # If python process has another signal handler registered, the signal handler
+        # is responsible for calling to close
+        self.store.close()
+        logger.info("Mooncake store close successfully.")
 
     def put(
         self,
