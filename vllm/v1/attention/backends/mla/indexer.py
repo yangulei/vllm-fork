@@ -232,18 +232,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Now deepgemm fp8_paged_mqa_logits does not support next_n > 2
         self.reorder_batch_threshold += min(self.num_speculative_tokens, 1)
 
-        props = torch.cuda.get_device_properties(self.device)
-        sm_count = props.multi_processor_count
-        self.num_sms = sm_count
+        # props = torch.cuda.get_device_properties(self.device)
+        # sm_count = props.multi_processor_count
+        # self.num_sms = sm_count
 
         self.decode_lens_buffer = torch.empty(
             (scheduler_config.max_num_seqs,), dtype=torch.int32, device=self.device
         )
 
         # See: DeepGMM/csrc/apis/attention.hpp
-        self.scheduler_metadata_buffer = torch.empty(
-            (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
-        )
+        # self.scheduler_metadata_buffer = torch.empty(
+        #     (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+        # )
 
     def build_one_prefill_chunk(
         self, reqs_start, reqs_end, query_start_loc_cpu, seq_lens_cpu, block_table
