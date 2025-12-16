@@ -104,6 +104,7 @@ elif current_platform.is_xpu():
 
 logger = init_logger(__name__)
 
+
 def per_token_group_quant_fp8_pytorch(
     x: torch.Tensor,
     group_size: int,
@@ -131,7 +132,7 @@ def per_token_group_quant_fp8_pytorch(
 
     # Get FP8 range
     # finfo = torch.finfo(dtype)
-    finfo = torch.finfo(torch.float8_e4m3fnuz) # HACK for gaudi2
+    finfo = torch.finfo(torch.float8_e4m3fnuz)  # HACK for gaudi2
     fp8_min = finfo.min
     fp8_max = finfo.max
 
@@ -654,7 +655,9 @@ def sparse_attn_indexer_pytorch(
         )
         topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens)
         topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
-        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1] ] = topk_indices.to(dtype=torch.int32)
+        topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
+            topk_indices.to(dtype=torch.int32)
+        )
     else:
         # PyTorch implementation of fp8_paged_mqa_logits
         logits = _pytorch_fp8_paged_mqa_logits(
@@ -669,11 +672,9 @@ def sparse_attn_indexer_pytorch(
         # q_fp8: [padded_token_num, num_heads, head_dim]
         padded_token_num = q_fp8.size(0)
         topk_indices = _pytorch_decode_topk_with_masking(
-            logits,
-            attn_metadata,
-            topk_tokens, padded_token_num, max_model_len
+            logits, attn_metadata, topk_tokens, padded_token_num, max_model_len
         )
-        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1]] = (
+        topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
             topk_indices
         )
 
@@ -687,8 +688,7 @@ def _pytorch_indexer_k_quant_and_cache(
     quant_block_size: int,
     scale_fmt: str | None,
 ) -> None:
-    """PyTorch implementation of indexer_k_quant_and_cache kernel.
-    """
+    """PyTorch implementation of indexer_k_quant_and_cache kernel."""
     head_dim = k.shape[-1]
     k = k.view(-1, head_dim)  # [total_tokens, head_dim]
 
@@ -701,7 +701,9 @@ def _pytorch_indexer_k_quant_and_cache(
 
     k_fp8_bytes = k_fp8.view(-1, head_dim).view(torch.uint8)
     scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
-    fp8_bytes = torch.cat([k_fp8_bytes, scale_bytes], dim=-1)  # [total_tokens, head_dim + 4]
+    fp8_bytes = torch.cat(
+        [k_fp8_bytes, scale_bytes], dim=-1
+    )  # [total_tokens, head_dim + 4]
 
     kv_cache = kv_cache.view(-1, head_dim + 4)
     slot_mapping = slot_mapping.view(-1)
@@ -742,15 +744,16 @@ def _pytorch_topk_with_bounds(
     """PyTorch implementation of bounded top-k selection."""
     seq_len = logits.shape[0]
 
-    mask = torch.triu(torch.ones(logits.shape, device=logits.device, dtype=torch.bool),
-                        diagonal=1)
+    mask = torch.triu(
+        torch.ones(logits.shape, device=logits.device, dtype=torch.bool), diagonal=1
+    )
 
     # Apply bounds masking before topk
-    logits = logits.masked_fill(mask, float('-inf'))
+    logits = logits.masked_fill(mask, float("-inf"))
 
     # Get top-k indices
     topk_indices = logits.topk(min(topk_tokens, seq_len), dim=-1)[1]
-    topk_indices = topk_indices.masked_fill(mask[:, :min(topk_tokens, seq_len)], -1)
+    topk_indices = topk_indices.masked_fill(mask[:, : min(topk_tokens, seq_len)], -1)
 
     return topk_indices
 
@@ -785,8 +788,8 @@ def _pytorch_fp8_paged_mqa_logits(
     block_list = attn_metadata.block_list
     block_mapping = attn_metadata.block_mapping
 
-    from vllm_gaudi.extension.utils import VLLMKVCache
     from vllm_gaudi.extension.ops import batch2block
+    from vllm_gaudi.extension.utils import VLLMKVCache
 
     q_float = q_fp8.float() * weights[..., None]
     q_float = batch2block(q_float, block_mapping.float()).unsqueeze(-2)
@@ -806,19 +809,79 @@ def _pytorch_fp8_paged_mqa_logits(
         assert q_heads % kv_heads == 0
         # q_fp8: [padded_block_num, q_head, 1, head_dim] [:, 64, 1, 128]
         # key: [padded_block_num, kv_head, block_size, head_dim] [:, 1, 128, 128]
-        k_dequant = k_dequant.repeat_interleave(int(q_heads/kv_heads), dim=1)
+        k_dequant = k_dequant.repeat_interleave(int(q_heads / kv_heads), dim=1)
 
     attn = torch.matmul(q_float, k_dequant.transpose(-2, -1))
     # attn: [padded_block_num, q_head, 1, block_size] [:, 64, 1, 128]
     attn = attn.relu().sum(dim=1).squeeze(-2)
 
-    logits = torch.zeros(padded_token_num, max_model_len,
-                        device=q_fp8.device, dtype=torch.float32)
-    for token_idx in range(padded_token_num): # seq
-        idx = block_groups == token_idx
-        batch_block_indices = torch.nonzero(idx, as_tuple=False).squeeze(-1)
-        selected = attn[batch_block_indices].flatten()
-        logits[token_idx, :selected.shape[0]] = selected
+    bs = padded_token_num
+    num_blocks = block_groups.shape[0]
+    block_size = attn.shape[-1]
+    device = q_fp8.device
+    # Per-sequence block mask: [bs, num_blocks] (True where block belongs to the sequence)
+    seq_ids = torch.arange(bs, device=device, dtype=block_groups.dtype)  # [bs]
+    mask_blocks = block_groups[None, :] == seq_ids[:, None]  # [bs, num_blocks] bool
+
+    # Previous column of mask (right-shift with zero at column 0), all static-shape ops
+    prev_mask = torch.cat(
+        [
+            torch.zeros(bs, 1, dtype=mask_blocks.dtype, device=device),
+            mask_blocks[:, :-1],
+        ],
+        dim=1,
+    )
+
+    # Rising edge one-hot for start of the contiguous run: [bs, num_blocks] bool
+    start_onehot = mask_blocks & (~prev_mask)
+
+    # ---- Use MATMUL (GEMM) to get start index (no cumsum) ----
+    # Dot with column indices to obtain the start position per sequence.
+    col_idx = torch.arange(
+        num_blocks, device=device, dtype=torch.float32
+    )  # [num_blocks]
+    start_idx = (start_onehot.to(torch.float32) @ col_idx).to(torch.int64)  # [bs] long
+
+    # Block indices and positions (zeros for non-selected blocks)
+    block_idx = torch.arange(num_blocks, device=device, dtype=torch.int64)[
+        None, :
+    ]  # [1, num_blocks]
+    pos_blocks = (block_idx - start_idx[:, None]) * mask_blocks.to(
+        torch.int64
+    )  # [bs, num_blocks]
+
+    # Optional: respect max_model_len capacity (drop overflow blocks)
+    max_blocks_per_seq = max_model_len // block_size
+    cap_mask = (pos_blocks < max_blocks_per_seq).to(attn.dtype)  # [bs, num_blocks]
+
+    # Token indices inside each block: [1,1,block_size], long
+    idx_in_block = torch.arange(block_size, device=device, dtype=torch.int64)[
+        None, None, :
+    ]
+
+    # Target token positions in static buffer [bs, num_blocks * block_size]
+    # Clamp negative (non-selected) pos to 0; src is zero there anyway.
+    target_idx = (
+        pos_blocks[:, :, None].clamp(min=0) * block_size
+    ) + idx_in_block  # [bs, num_blocks, block_size]
+
+    # Values to scatter (zero out non-selected and overflow)
+    values = (
+        attn[None, :, :].expand(bs, num_blocks, block_size)
+        * mask_blocks[:, :, None].to(attn.dtype)
+        * cap_mask[:, :, None]
+    )
+
+    # Flatten for scatter_add_ (static shapes)
+    target_idx_flat = target_idx.reshape(bs, num_blocks * block_size)
+    values_flat = values.reshape(bs, num_blocks * block_size)
+
+    # Output flat buffer (static size); compact to front via scatter_add_
+    out_flat = torch.zeros(bs, num_blocks * block_size, dtype=attn.dtype, device=device)
+    out_flat.scatter_add_(dim=1, index=target_idx_flat, src=values_flat)
+
+    # Final logits [bs, max_model_len]
+    logits = out_flat[:, :max_model_len].contiguous()
 
     return logits
 
@@ -868,13 +931,25 @@ def sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor | None,
 ) -> torch.Tensor:
     # Check if PyTorch implementation should be used
-    use_pytorch_impl = os.environ.get('VLLM_USE_PYTORCH_SPARSE_INDEXER', 'false').lower() == 'true'
+    use_pytorch_impl = (
+        os.environ.get("VLLM_USE_PYTORCH_SPARSE_INDEXER", "false").lower() == "true"
+    )
 
     if use_pytorch_impl:
         return sparse_attn_indexer_pytorch(
-            hidden_states, k_cache_prefix, kv_cache, q_fp8, k, weights,
-            quant_block_size, scale_fmt, topk_tokens, head_dim, max_model_len,
-            total_seq_lens, topk_indices_buffer
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            q_fp8,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
         )
 
     # Original implementation (unchanged for compatibility)
@@ -1133,7 +1208,12 @@ class Indexer(nn.Module):
         q = q.view(-1, self.head_dim)
 
         # Use PyTorch implementation if environment variable is set
-        use_pytorch_quant = typing.cast(str, os.environ.get('VLLM_USE_PYTORCH_FP8_QUANT', 'false')).lower() == 'true'
+        use_pytorch_quant = (
+            typing.cast(
+                str, os.environ.get("VLLM_USE_PYTORCH_FP8_QUANT", "false")
+            ).lower()
+            == "true"
+        )
 
         if use_pytorch_quant:
             q_fp8, q_scale = per_token_group_quant_fp8_pytorch(
@@ -1149,10 +1229,12 @@ class Indexer(nn.Module):
                 column_major_scales=False,
                 use_ue8m0=self.scale_fmt is not None,
             )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim) # [padded_token_num, n_head, head_dim] n_head: 64
-        q_scale = q_scale.view(-1, self.n_head, 1) # [padded_token_num, n_head, 1]
+        q_fp8 = q_fp8.view(
+            -1, self.n_head, self.head_dim
+        )  # [padded_token_num, n_head, head_dim] n_head: 64
+        q_scale = q_scale.view(-1, self.n_head, 1)  # [padded_token_num, n_head, 1]
 
-        weights, _ = self.weights_proj(hidden_states) # [padded_token_num, n_head]
+        weights, _ = self.weights_proj(hidden_states)  # [padded_token_num, n_head]
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
@@ -1711,6 +1793,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
             # support load less layers for test
             if name.startswith("model.layers."):
                 import re
+
                 layer_num = re.search(r"model\.layers\.(\d+)\.", name, re.IGNORECASE)
                 if layer_num:
                     curr_layer_num = int(layer_num.group(1))
