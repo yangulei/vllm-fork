@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import contextlib
+import threading
 import multiprocessing
 import time
 import weakref
@@ -206,7 +207,8 @@ class APIServerProcessManager:
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
 
-            proc = spawn_context.Process(target=target_server_fn,
+            # proc = spawn_context.Process(target=target_server_fn,
+            proc = threading.Thread(target=target_server_fn,
                                          name=f"ApiServer_{i}",
                                          args=(listen_address, sock, args,
                                                client_config))
@@ -299,11 +301,12 @@ def wait_for_completion_or_failure(
 
 # Note(rob): shutdown function cannot be a bound method,
 # else the gc cannot collect the object.
-def shutdown(procs: list[BaseProcess]):
+def shutdown(procs: list[threading.Thread]):
     # Shutdown the process.
     for proc in procs:
         if proc.is_alive():
-            proc.terminate()
+            # proc.terminate()
+            proc.join()
 
     # Allow 5 seconds for remaining procs to terminate.
     deadline = time.monotonic() + 5

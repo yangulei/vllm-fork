@@ -463,7 +463,8 @@ class WorkerProc:
             "shared_worker_lock": shared_worker_lock,
         }
         # Run EngineCore busy loop in background process.
-        proc = context.Process(target=WorkerProc.worker_main,
+        # proc = context.Process(target=WorkerProc.worker_main,
+        proc = threading.Thread(target=WorkerProc.worker_main,
                                kwargs=process_kwargs,
                                name=f"VllmWorker-{rank}",
                                daemon=True)

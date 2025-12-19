@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import threading
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -94,6 +95,7 @@ class CoreEngineProcManager:
         client_handshake_address: Optional[str] = None,
     ):
         context = get_mp_context()
+        lock = threading.Lock()
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -106,7 +108,7 @@ class CoreEngineProcManager:
             common_kwargs[
                 "client_handshake_address"] = client_handshake_address
 
-        self.processes: list[BaseProcess] = []
+        self.processes: list[threading.Thread] = []
         local_dp_ranks = []
         for index in range(local_engine_count):
             local_index = local_start_index + index
@@ -115,7 +117,7 @@ class CoreEngineProcManager:
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
             self.processes.append(
-                context.Process(target=target_fn,
+                threading.Thread(target=target_fn,
                                 name=f"EngineCore_DP{global_index}",
                                 kwargs=common_kwargs | {
                                     "dp_rank": global_index,
@@ -145,13 +147,12 @@ class CoreEngineProcManager:
         connection.wait(proc.sentinel for proc in self.processes)
 
     def sentinels(self) -> list:
-        return [proc.sentinel for proc in self.processes]
+        return [None for proc in self.processes]
 
     def finished_procs(self) -> dict[str, int]:
         """Returns dict of proc name -> exit code for any finished procs."""
         return {
-            proc.name: proc.exitcode
-            for proc in self.processes if proc.exitcode is not None
+            proc.name: 0 for proc in self.processes
         }
 
 

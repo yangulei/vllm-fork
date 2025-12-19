@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import multiprocessing
+import threading
 import time
 import weakref
 from typing import Optional
@@ -75,7 +76,8 @@ class DPCoordinator:
         back_output_address = get_engine_client_zmq_addr(local_only_eng, host)
 
         context = get_mp_context()
-        self.proc: multiprocessing.Process = context.Process(
+        # self.proc: multiprocessing.Process = context.Process(
+        self.proc: threading.Thread = threading.Thread(
             target=DPCoordinatorProc.run_coordinator,
             name="VLLM_DP_Coordinator",
             kwargs={

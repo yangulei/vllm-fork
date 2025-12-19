@@ -34,7 +34,7 @@ from time import sleep
 
 from vllm import LLM, SamplingParams
 from vllm.utils import get_open_port
-
+import threading
 
 def parse_args():
     import argparse
@@ -226,7 +226,8 @@ if __name__ == "__main__":
     for local_dp_rank, global_dp_rank in enumerate(
         range(node_rank * dp_per_node, (node_rank + 1) * dp_per_node)
     ):
-        proc = Process(
+        # proc = Process(
+        proc = threading.Thread(
             target=main,
             args=(
                 args.model,
