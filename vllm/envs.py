@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FORCE_CHANNEL_FP8: bool = True
     VLLM_HPU_CONVERT_TO_FP8UZ: bool = True
     VLLM_HPU_FORCE_MARK_STEP: bool = True
+    VLLM_HPU_USE_CONTEXT_PADDING: bool = False
     VLLM_DETOKENIZE_ON_OPENAI_SERVER: bool = False
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
@@ -755,6 +756,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts model weights to FP8UZ format.
     "VLLM_HPU_CONVERT_TO_FP8UZ":
     lambda: os.environ.get("VLLM_HPU_CONVERT_TO_FP8UZ", "false").lower() in
+    ("1", "true"),
+    "VLLM_HPU_USE_CONTEXT_PADDING":
+    lambda: os.environ.get("VLLM_HPU_USE_CONTEXT_PADDING", "false").lower() in
     ("1", "true"),
 
     # Convert block fp8 to channel fp8 for HPU without INC

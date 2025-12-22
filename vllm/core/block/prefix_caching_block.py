@@ -7,6 +7,7 @@ from os.path import commonprefix
 from typing import (Callable, Dict, FrozenSet, Iterable, List, Optional, Set,
                     Tuple)
 
+import vllm.envs as envs
 from vllm.core.block.common import (CacheMetricData, CopyOnWriteTracker,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId, Device,
@@ -1076,8 +1077,8 @@ class ComputedBlocksTracker:
         # This is O(logN), where N is the number of blocks.
         num_cached_blocks = len(
             self._allocator.find_cached_blocks_prefix(block_hashes))
-        if current_platform.is_hpu(
-        ) and num_cached_blocks > 0 and seq.is_prefill():
+        if current_platform.is_hpu() and not envs.VLLM_HPU_USE_CONTEXT_PADDING \
+            and num_cached_blocks > 0 and seq.is_prefill():
             from vllm_hpu_extension.bucketing.common import (
                 get_bucketing_manager)
             hpu_bucketing_manager = get_bucketing_manager()
