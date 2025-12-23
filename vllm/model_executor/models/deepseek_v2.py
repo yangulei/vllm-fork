@@ -823,7 +823,7 @@ def _pytorch_fp8_paged_mqa_logits(
     seq_ids = torch.arange(bs, device=device, dtype=block_groups.dtype)  # [bs]
     mask_blocks = block_groups[None, :] == seq_ids[:, None]  # [bs, num_blocks] bool
 
-    # Previous column of mask (right-shift with zero at column 0), all static-shape ops
+    # Previous element (right-shift) to detect the rising edge of the contiguous run
     prev_mask = torch.cat(
         [
             torch.zeros(bs, 1, dtype=mask_blocks.dtype, device=device),
@@ -832,17 +832,16 @@ def _pytorch_fp8_paged_mqa_logits(
         dim=1,
     )
 
-    # Rising edge one-hot for start of the contiguous run: [bs, num_blocks] bool
+    # Rising edge one-hot for the start of the run: [bs, num_blocks]
     start_onehot = mask_blocks & (~prev_mask)
 
-    # ---- Use MATMUL (GEMM) to get start index (no cumsum) ----
-    # Dot with column indices to obtain the start position per sequence.
+    # ---- MATMUL to get the start index of the run (fast on HPU) ----
     col_idx = torch.arange(
         num_blocks, device=device, dtype=torch.float32
     )  # [num_blocks]
     start_idx = (start_onehot.to(torch.float32) @ col_idx).to(torch.int64)  # [bs] long
 
-    # Block indices and positions (zeros for non-selected blocks)
+    # Block indices and packed positions (0.. for selected blocks, 0 for unselected)
     block_idx = torch.arange(num_blocks, device=device, dtype=torch.int64)[
         None, :
     ]  # [1, num_blocks]
@@ -850,38 +849,44 @@ def _pytorch_fp8_paged_mqa_logits(
         torch.int64
     )  # [bs, num_blocks]
 
-    # Optional: respect max_model_len capacity (drop overflow blocks)
-    max_blocks_per_seq = max_model_len // block_size
-    cap_mask = (pos_blocks < max_blocks_per_seq).to(attn.dtype)  # [bs, num_blocks]
-
-    # Token indices inside each block: [1,1,block_size], long
+    # Token indices inside each block: [1,1,block_size]
     idx_in_block = torch.arange(block_size, device=device, dtype=torch.int64)[
         None, None, :
     ]
 
-    # Target token positions in static buffer [bs, num_blocks * block_size]
-    # Clamp negative (non-selected) pos to 0; src is zero there anyway.
-    target_idx = (
-        pos_blocks[:, :, None].clamp(min=0) * block_size
-    ) + idx_in_block  # [bs, num_blocks, block_size]
+    # Global target indices for tokens (before clamping): [bs, num_blocks, block_size]
+    global_target = pos_blocks[:, :, None] * block_size + idx_in_block
 
-    # Values to scatter (zero out non-selected and overflow)
-    values = (
-        attn[None, :, :].expand(bs, num_blocks, block_size)
-        * mask_blocks[:, :, None].to(attn.dtype)
-        * cap_mask[:, :, None]
+    # Keep only tokens that fit inside max_model_len (handles partial last block AND padding)
+    keep_mask = mask_blocks[:, :, None] & (
+        global_target < max_model_len
+    )  # [bs, num_blocks, block_size]
+
+    # Values to scatter: zero where keep_mask==False
+    values = attn[None, :, :].expand(bs, num_blocks, block_size) * keep_mask.to(
+        attn.dtype
     )
 
+    # Indices must be valid; clamp out-of-range (their src is zero so harmless)
+    target_idx = global_target.clamp(
+        min=0, max=max_model_len - 1
+    )  # [bs, num_blocks, block_size]
+
     # Flatten for scatter_add_ (static shapes)
-    target_idx_flat = target_idx.reshape(bs, num_blocks * block_size)
-    values_flat = values.reshape(bs, num_blocks * block_size)
+    target_idx_flat = target_idx.reshape(
+        bs, num_blocks * block_size
+    )  # [bs, num_blocks*block_size]
+    values_flat = values.reshape(
+        bs, num_blocks * block_size
+    )  # [bs, num_blocks*block_size]
 
-    # Output flat buffer (static size); compact to front via scatter_add_
-    out_flat = torch.zeros(bs, num_blocks * block_size, dtype=attn.dtype, device=device)
-    out_flat.scatter_add_(dim=1, index=target_idx_flat, src=values_flat)
+    # Final output buffer is the desired shape directly (pads with zeros if shorter)
+    logits = torch.zeros(
+        bs, max_model_len, dtype=attn.dtype, device=device
+    )  # [bs, max_model_len]
 
-    # Final logits [bs, max_model_len]
-    logits = out_flat[:, :max_model_len].contiguous()
+    # Compact to the front per sequence
+    logits.scatter_add_(dim=1, index=target_idx_flat, src=values_flat)
 
     return logits
 
