@@ -339,9 +339,9 @@ set_perf_tuning(){
     fi
 
     # VLLM_FP32_SOFTMAX=false by default, set to true for models with accuracy issues.
-    if [[ $model_name_lower == *"deepseek-r1-distill-qwen-7b"* \
-            || $model_name_lower == *"qwen2-7b-instruct"* \
-            || $model_name_lower == *"qwen2.5-7b-instruct"* ]]; then
+    if [[ $model_name_lower == *"qwen-7b"* \
+            || $model_name_lower == *"qwen2-7b"* \
+            || $model_name_lower == *"qwen2.5-7b"* ]]; then
         export VLLM_FP32_SOFTMAX=true
         echo "Set VLLM_FP32_SOFTMAX=true for $model_name"
     fi
