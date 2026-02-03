@@ -245,7 +245,8 @@ class MiniMaxM2Attention(nn.Module):
     ) -> torch.Tensor:
         tp_size = self.tp_size
         tp_rank = self.tp_rank
-        bs, seq, _ = hidden_states.shape
+        bs = hidden_states.shape[0] if hidden_states.dim() == 3 else 1
+        seq = hidden_states.shape[-2]
         x = hidden_states.reshape(-1, self.hidden_size)
         x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / self.q_proj.input_scale,
                                              False, False,
