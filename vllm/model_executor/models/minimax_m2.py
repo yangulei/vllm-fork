@@ -34,13 +34,12 @@ from transformers import PretrainedConfig
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
-from vllm.distributed import (get_pp_group,
+from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.layernorm import (MiniMaxText01RMSNormTP,
-                                                  RMSNorm)
-from vllm.model_executor.layers.linear import (QKVParallelLinear,
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -123,7 +122,6 @@ class MiniMaxM2MoE(nn.Module):
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         final_hidden_states = self.experts(hidden_states=hidden_states,
                                            router_logits=router_logits)
-        final_hidden_states = final_hidden_states
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
@@ -172,7 +170,7 @@ class MiniMaxM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
+        '''
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -181,6 +179,29 @@ class MiniMaxM2Attention(nn.Module):
             bias=qkv_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+        )
+        '''
+
+        self.q_proj = ReplicatedLinear(
+            hidden_size,
+            self.head_dim * self.total_num_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ReplicatedLinear(
+            hidden_size,
+            self.head_dim * self.total_num_kv_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            hidden_size,
+            self.head_dim * self.total_num_kv_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_proj",
         )
 
         self.o_proj = RowParallelLinear(
@@ -209,22 +230,107 @@ class MiniMaxM2Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.q_norm = MiniMaxText01RMSNormTP(self.head_dim *
-                                             self.total_num_heads,
-                                             eps=rms_norm_eps)
-        self.k_norm = MiniMaxText01RMSNormTP(self.head_dim *
-                                             self.total_num_kv_heads,
-                                             eps=rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim * self.total_num_heads,
+                              eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim * self.total_num_kv_heads,
+                              eps=rms_norm_eps)
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        tp_size = self.tp_size
+        tp_rank = self.tp_rank
+        bs, seq, _ = hidden_states.shape
+        x = hidden_states.reshape(-1, self.hidden_size)
+        x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / self.q_proj.input_scale,
+                                             False, False,
+                                             torch.float8_e4m3fn)[0]
+        qweight_slice = self.q_proj.weight.size(1) // tp_size
+        kweight_slice = self.k_proj.weight.size(1) // tp_size
+
+        if bs * seq > 256:
+            W_Q = self.q_proj.weight.transpose(0, 1)[ \
+                tp_rank * qweight_slice : (tp_rank + 1) * qweight_slice, :]
+            W_K = self.k_proj.weight.transpose(0, 1)[ \
+                tp_rank * kweight_slice : (tp_rank + 1) * kweight_slice, :]
+            S_Q = self.q_proj.weight_scale[ \
+                tp_rank * qweight_slice : (tp_rank + 1) * qweight_slice]
+            S_K = self.k_proj.weight_scale[ \
+                tp_rank * kweight_slice : (tp_rank + 1) * kweight_slice]
+        else:
+            W_Q = self.q_proj.weight.transpose(0, 1)
+            W_K = self.k_proj.weight.transpose(0, 1)
+            S_Q = self.q_proj.weight_scale
+            S_K = self.k_proj.weight_scale
+        W_V = self.v_proj.weight.transpose(0, 1)
+        S_V = self.v_proj.weight_scale
+
+        q = torch.ops.hpu.fp8_gemm_v2(A=x_fp8,
+                                      trans_A=False,
+                                      B=W_Q.contiguous(),
+                                      trans_B=True,
+                                      D=None,
+                                      out_dtype=torch.bfloat16,
+                                      A_scale_inv=self.q_proj.input_scale,
+                                      B_scale_inv=S_Q,
+                                      bias=None,
+                                      accumulate=False).reshape(bs, seq, -1)
+        k = torch.ops.hpu.fp8_gemm_v2(A=x_fp8,
+                                      trans_A=False,
+                                      B=W_K.contiguous(),
+                                      trans_B=True,
+                                      D=None,
+                                      out_dtype=torch.bfloat16,
+                                      A_scale_inv=self.q_proj.input_scale,
+                                      B_scale_inv=S_K,
+                                      bias=None,
+                                      accumulate=False).reshape(bs, seq, -1)
+        v = torch.ops.hpu.fp8_gemm_v2(A=x_fp8,
+                                      trans_A=False,
+                                      B=W_V.contiguous(),
+                                      trans_B=True,
+                                      D=None,
+                                      out_dtype=torch.bfloat16,
+                                      A_scale_inv=self.q_proj.input_scale,
+                                      B_scale_inv=S_V,
+                                      bias=None,
+                                      accumulate=False).reshape(bs, seq, -1)
+
+        if bs * seq > 256:
+            qnorm_slice = self.head_dim * self.total_num_heads // tp_size
+            knorm_slice = self.head_dim * self.total_num_kv_heads // tp_size
+            qnorm_weight = self.q_norm.weight[ \
+                tp_rank * qnorm_slice : (tp_rank + 1) * qnorm_slice]
+            knorm_weight = self.k_norm.weight[ \
+                tp_rank * knorm_slice : (tp_rank + 1) * knorm_slice]
+            orig_dtype = q.dtype
+            q = q.to(torch.float32)
+            k = k.to(torch.float32)
+            q_var = q.pow(2).mean(dim=-1).unsqueeze(1)
+            k_var = k.pow(2).mean(dim=-1).unsqueeze(1)
+            if tp_size > 1:
+                qk_var = torch.cat([q_var, k_var], dim=1)
+                qk_var = tensor_model_parallel_all_reduce(qk_var) / tp_size
+                q_var, k_var = qk_var.chunk(2, dim=1)
+            q = q * torch.rsqrt(
+                q_var.transpose(-1, -2) +
+                self.q_norm.variance_epsilon) * qnorm_weight
+            k = k * torch.rsqrt(
+                k_var.transpose(-1, -2) +
+                self.k_norm.variance_epsilon) * knorm_weight
+            q = q.to(orig_dtype)
+            k = k.to(orig_dtype)
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            q = q.reshape(bs, seq, tp_size, -1).permute(2, 0, 1, 3)[tp_rank]
+            k = k.reshape(bs, seq, tp_size, -1).permute(2, 0, 1, 3)[tp_rank]
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -396,12 +502,12 @@ class MiniMaxM2Model(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
+        stacked_params_mapping = []
+        # (param_name, shard_name, shard_id)
+        #            ("qkv_proj", "q_proj", "q"),
+        #            ("qkv_proj", "k_proj", "k"),
+        #            ("qkv_proj", "v_proj", "v"),
+        #        ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
