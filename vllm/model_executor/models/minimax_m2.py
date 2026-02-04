@@ -245,8 +245,9 @@ class MiniMaxM2Attention(nn.Module):
     ) -> torch.Tensor:
         tp_size = self.tp_size
         tp_rank = self.tp_rank
-        bs = hidden_states.shape[0] if hidden_states.dim() == 3 else 1
-        seq = hidden_states.shape[-2]
+        orig_shape = hidden_states.shape
+        bs = orig_shape[0] if len(orig_shape) == 3 else 1
+        seq = orig_shape[-2]
         x = hidden_states.reshape(-1, self.hidden_size)
         x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / self.q_proj.input_scale,
                                              False, False,
@@ -335,7 +336,7 @@ class MiniMaxM2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-        return output
+        return output.reshape(orig_shape)
 
 
 class MiniMaxM2DecoderLayer(nn.Module):
