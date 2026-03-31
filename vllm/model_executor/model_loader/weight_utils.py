@@ -476,10 +476,12 @@ def safetensors_weights_iterator(
                     fp8_e4m3fn_max = torch.finfo(torch.float8_e4m3fn).max
                     if param.dtype == torch.float8_e4m3fn:
                         param = (param.float() * fp8_e4m3fnuz_max /
-                                 fp8_e4m3fn_max).to(torch.float8_e4m3fnuz)
+                                 fp8_e4m3fn_max).to(torch.float8_e4m3fn)
                     elif param.dtype in [torch.float32, torch.bfloat16
                                          ] and "scale" in name.split(".")[-1]:
                         param *= fp8_e4m3fn_max / fp8_e4m3fnuz_max
+                if current_platform.is_hpu():
+                    param = param.to("hpu")
                 yield name, param
 
 
@@ -538,10 +540,12 @@ def fastsafetensors_weights_iterator(
                         fp8_e4m3fn_max = torch.finfo(torch.float8_e4m3fn).max
                         if t.dtype == torch.float8_e4m3fn:
                             t = (t.float() * fp8_e4m3fnuz_max /
-                                 fp8_e4m3fn_max).to(torch.float8_e4m3fnuz)
+                                 fp8_e4m3fn_max).to(torch.float8_e4m3fn)
                         elif t.dtype in [torch.float32, torch.bfloat16
                                          ] and "scale" in k.split(".")[-1]:
                             t *= fp8_e4m3fn_max / fp8_e4m3fnuz_max
+                    if current_platform.is_hpu():
+                        t = t.to("hpu")
                     yield k, t
             finally:
                 fb.close()
