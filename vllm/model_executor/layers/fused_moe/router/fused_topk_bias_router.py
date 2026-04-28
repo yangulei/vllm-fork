@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.platforms import current_platform
 
 
 def vllm_topk_softmax(
@@ -108,7 +109,7 @@ def fused_topk_bias(
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ):
-    if not rocm_aiter_ops.is_fused_moe_enabled():
+    if not rocm_aiter_ops.is_fused_moe_enabled() and not current_platform.is_xpu():
         assert hidden_states.size(0) == gating_output.size(0), (
             "Number of tokens mismatch"
         )

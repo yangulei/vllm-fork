@@ -481,10 +481,14 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4":
-            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+        if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 fp8_ds_mla layout: 448B NoPE + 128B RoPE + 8B fp8 scale
+            # = 584B per token. Only applies to the fp8 custom KV layout; the
+            # plain bf16/fp16 path falls through to the standard MLA formula
+            # (block * head_size * dtype_size) so the per-page byte budget
+            # matches the kernel's `get_kv_cache_shape` (head_size=512, bf16).
             return self.storage_block_size * 584
-        assert self.model_version is None, (
+        assert self.model_version is None or self.model_version == "deepseek_v4", (
             f"Unsupported model version: {self.model_version}"
         )
         return (

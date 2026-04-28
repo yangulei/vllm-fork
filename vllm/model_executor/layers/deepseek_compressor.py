@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, ClassVar, cast
 
 import torch
@@ -36,6 +37,10 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class CompressorBackend(AttentionBackend):
@@ -159,13 +164,15 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm.platforms import current_platform
+        alignment = 512 if current_platform.is_xpu() else 576
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            alignment=576,  # NOTE: FlashMLA requires 576B alignment
+            alignment=alignment,
         )
 
     def forward(self): ...
@@ -239,8 +246,14 @@ class DeepseekCompressor(nn.Module):
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
         )
+        self._is_xpu_c4 = False
 
-        if self.head_dim == 512:
+        if current_platform.is_xpu() and self.head_dim == 512:
+            self._xpu_c4_kv_insert = import_module(
+                "vllm.v1.attention.ops.deepseek_v4_ops.c4_kv_insert_bf16"
+            ).c4_kv_insert_bf16
+            self._is_xpu_c4 = True
+        elif self.head_dim == 512:
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
             )
@@ -291,6 +304,7 @@ class DeepseekCompressor(nn.Module):
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
         token_to_req_indices = state_metadata.token_to_req_indices
+        assert token_to_req_indices is not None
         slot_mapping = state_metadata.slot_mapping
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
@@ -300,7 +314,11 @@ class DeepseekCompressor(nn.Module):
         state_cache = self.state_cache.kv_cache
         # kv_state stored in first half, score_state stored in second half
         state_width = state_cache.shape[-1] // 2
-        pdl_kwargs = {} if current_platform.is_rocm() else {"launch_pdl": False}
+        pdl_kwargs = (
+            {}
+            if current_platform.is_rocm() or current_platform.is_xpu()
+            else {"launch_pdl": False}
+        )
 
         # Store the KV and score (with fused APE addition) in the state.
         # NOTE: PDL is disabled — both this kernel and _fused_kernel below
@@ -339,43 +357,62 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        self._fused_kernel[(num_actual,)](
-            # state cache
-            state_cache,
-            state_cache.stride(0),
-            state_cache.stride(1),
-            # metadata
-            token_to_req_indices,
-            positions,
-            slot_mapping,
-            block_table,
-            block_table.stride(0),
-            block_size,
-            # RMSNorm
-            self.norm.weight,
-            self.rms_norm_eps,
-            # RoPE
-            cos_sin_cache,
-            cos_sin_cache.stride(0),
-            # KV cache
-            kv_cache,
-            k_cache_metadata.slot_mapping,
-            kv_cache.shape[1],  # paged KV cache block size (tokens per block)
-            # constexprs
-            HEAD_SIZE=self.head_dim,
-            TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
-            STATE_WIDTH=state_width,
-            COMPRESS_RATIO=self.compress_ratio,
-            OVERLAP=self.overlap,
-            ROPE_HEAD_DIM=self.rope_head_dim,
-            FP8_MAX=448.0,
-            QUANT_BLOCK=self._quant_block,
-            TOKEN_STRIDE=self._token_stride,
-            SCALE_DIM=self._scale_dim,
-            KV_BLOCK_STRIDE=kv_cache.stride(0),
-            num_warps=self._num_warps,
-            **pdl_kwargs,
-        )
+        if self._is_xpu_c4:
+            logger.info_once("XPU: C4 KV insert (bf16) kernel dispatched")
+            self._xpu_c4_kv_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                rms_norm_weight=self.norm.weight.float(),
+                rms_norm_eps=self.rms_norm_eps,
+                cos_sin_cache=cos_sin_cache,
+                k_cache=kv_cache,
+                kv_slot_mapping=k_cache_metadata.slot_mapping,
+                kv_cache_block_size=kv_cache.shape[1],
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                rope_head_dim=self.rope_head_dim,
+            )
+        else:
+            self._fused_kernel[(num_actual,)](
+                # state cache
+                state_cache,
+                state_cache.stride(0),
+                state_cache.stride(1),
+                # metadata
+                token_to_req_indices,
+                positions,
+                slot_mapping,
+                block_table,
+                block_table.stride(0),
+                block_size,
+                # RMSNorm
+                self.norm.weight,
+                self.rms_norm_eps,
+                # RoPE
+                cos_sin_cache,
+                cos_sin_cache.stride(0),
+                # KV cache
+                kv_cache,
+                k_cache_metadata.slot_mapping,
+                kv_cache.shape[1],  # paged KV cache block size (tokens per block)
+                # constexprs
+                HEAD_SIZE=self.head_dim,
+                TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+                STATE_WIDTH=state_width,
+                COMPRESS_RATIO=self.compress_ratio,
+                OVERLAP=self.overlap,
+                ROPE_HEAD_DIM=self.rope_head_dim,
+                FP8_MAX=448.0,
+                QUANT_BLOCK=self._quant_block,
+                TOKEN_STRIDE=self._token_stride,
+                SCALE_DIM=self._scale_dim,
+                KV_BLOCK_STRIDE=kv_cache.stride(0),
+                num_warps=self._num_warps,
+                **pdl_kwargs,
+            )
 
 
 @triton.jit

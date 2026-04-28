@@ -169,6 +169,8 @@ class DeepseekV4FlashMLASparseBackend(FlashMLASparseBackend):
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
         else:
+            # XPU forces DeepseekV4 C4/main MLA KV cache to bf16, so the generic
+            # MLA layout is reached here and uses the semantic head_size directly.
             return (num_blocks, block_size, head_size)
 
 

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from typing import Any
+
 import torch
 
 import vllm.envs as envs
@@ -26,6 +28,9 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
+
+ops: Any = None
+xpu_ops: Any = None
 
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
@@ -166,6 +171,7 @@ def sparse_attn_indexer(
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
+        assert ops is not None
         ops.indexer_k_quant_and_cache(
             k,
             kv_cache,
@@ -196,13 +202,24 @@ def sparse_attn_indexer(
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
             if not chunk.skip_kv_gather:
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_quant,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
+                if current_platform.is_xpu():
+                    assert xpu_ops is not None
+                    xpu_ops.cp_gather_indexer_k_quant_cache(  # type: ignore[attr-defined]
+                        kv_cache,
+                        k_quant,
+                        k_scale,
+                        chunk.block_table,
+                        chunk.cu_seq_lens,
+                    )
+                else:
+                    assert ops is not None
+                    ops.cp_gather_indexer_k_quant_cache(
+                        kv_cache,
+                        k_quant,
+                        k_scale,
+                        chunk.block_table,
+                        chunk.cu_seq_lens,
+                    )
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -220,14 +237,29 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            logits = fp8_fp4_mqa_logits(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-            )
+            if current_platform.is_xpu() and not use_fp4_cache:
+                logger.info_once("XPU: indexer logits prefill kernel dispatched")
+                from vllm.v1.attention.ops.deepseek_v4_ops.indexer_logits_prefill_fp8 import (
+                    indexer_logits_prefill_fp8,
+                )
+
+                logits = indexer_logits_prefill_fp8(
+                    q_slice_cast,
+                    k_quant_cast,
+                    k_scale_cast,
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+            else:
+                logits = fp8_fp4_mqa_logits(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
             num_rows = logits.shape[0]
 
             topk_indices = topk_indices_buffer[
@@ -235,6 +267,7 @@ def sparse_attn_indexer(
             ]
 
             if current_platform.is_xpu():
+                assert xpu_ops is not None
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
                     chunk.cu_seqlen_ks,
@@ -260,6 +293,7 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
+        raw_kv_cache = kv_cache
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -307,16 +341,37 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        logits = fp8_fp4_paged_mqa_logits(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-            clean_logits=False,
-        )
+        if current_platform.is_xpu() and not use_fp4_cache:
+            logger.info_once("XPU: indexer logits decode kernel dispatched")
+            from vllm.v1.attention.ops.deepseek_v4_ops.indexer_logits_decode_fp8_paged import (
+                indexer_logits_decode_fp8_paged,
+            )
+
+            q_decode = padded_q_quant_decode_tokens
+            if q_decode.ndim == 3:
+                q_decode = q_decode.reshape(batch_size, next_n, *q_decode.shape[1:])
+            k_fp8 = raw_kv_cache[:, :, :head_dim].view(torch.float8_e4m3fn)
+            k_scale = raw_kv_cache[:, :, head_dim:].view(torch.float32).squeeze(-1)
+            logits = indexer_logits_decode_fp8_paged(
+                q_decode,
+                k_fp8,
+                k_scale,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=max_model_len,
+            )
+        else:
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -335,6 +390,7 @@ def sparse_attn_indexer(
             )
         else:
             if current_platform.is_xpu():
+                assert xpu_ops is not None
                 xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
                     logits,
                     next_n,
@@ -389,6 +445,7 @@ def sparse_attn_indexer_fake(
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
 ) -> torch.Tensor:
+    assert topk_indices_buffer is not None
     return topk_indices_buffer
 
 

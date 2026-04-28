@@ -180,6 +180,42 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         )
 
 
+class XPUTritonFp8BlockScaledMMKernel(TritonFp8BlockScaledMMKernel):
+    """XPU variant: same Triton implementation, gated by XPU platform check.
+
+    The underlying w8a8_triton_block_scaled_mm kernel is pure Triton and runs
+    on Intel XPU via triton-xpu. is_supported() override is the only XPU-specific
+    change; kernel body is shared with the CUDA path.
+    """
+
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        if not current_platform.is_xpu():
+            return False, "only XPU devices are supported by this variant."
+        return True, None
+
+    def apply_block_scaled_mm(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        # triton-xpu's dtype canonicalisation table lacks float8_e8m0fnu.
+        # E8M0 stores only the FP exponent: value = 2^(byte - 127).
+        # Decode to float32 before dispatch so the kernel sees a numeric scale.
+        if Bs.dtype == torch.float8_e8m0fnu:
+            Bs = torch.exp2(Bs.to(torch.float32) - 127.0)
+        return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+            A,
+            B,
+            As,
+            Bs,
+            list(self.weight_group_shape),
+            self.config.out_dtype,
+        )
+
+
 # TODO we should be able to change the type of block_size to GroupShape
 # after we resolve GroupShape compilation issue
 # https://github.com/vllm-project/vllm/issues/25270

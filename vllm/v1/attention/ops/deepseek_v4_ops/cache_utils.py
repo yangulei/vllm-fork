@@ -271,6 +271,7 @@ def _dequantize_and_gather_k_kernel(
 
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+                x_uint8 = x_uint8.to(tl.uint8)
 
                 # Bitcast uint8 back to fp8
                 x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)

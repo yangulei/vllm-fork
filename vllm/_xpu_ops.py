@@ -4,7 +4,9 @@
 from typing import TYPE_CHECKING
 
 import torch
-from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+from vllm_xpu_kernels.flash_attn_interface import (  # pyright: ignore[reportMissingImports]
+    flash_attn_varlen_func,
+)
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -182,6 +184,7 @@ def _xpu_ops_deepseek_scaling_rope_fake(
     rotary_dim: int,
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    assert key is not None
     return query, key
 
 
@@ -297,7 +300,7 @@ def _xpu_mxfp4_quantize_fake(
 
 
 # Global flag to ensure ops are registered only once
-_OPS_REGISTERED = False
+_ops_registered = False
 
 
 class xpu_ops:
@@ -597,7 +600,7 @@ class xpu_ops:
         block_stride = kv_cache.stride(0)  # stride for each block
 
         # Flatten kv_cache for easier indexing
-        kv_cache_flat = kv_cache.view(-1)
+        kv_cache_flat = kv_cache.reshape(-1)
 
         # Calculate source offset for K values for all tokens (vectorized)
         src_block_offsets = physical_block_indices * block_stride
@@ -642,9 +645,10 @@ class xpu_ops:
         )
         mask = mask_lo & mask_hi
         topk_indices.masked_fill_(~mask, -1)
-        raw_topk_indices[: topk_indices.shape[0], : topk_indices.shape[1]] = (
+        raw_topk_indices[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
             topk_indices
         )
+        return raw_topk_indices
 
     @staticmethod
     def top_k_per_row_decode(
@@ -661,14 +665,23 @@ class xpu_ops:
         batch_size = seq_lens.size(0)
         # padded query len
         padded_num_tokens = batch_size * next_n
+        if logits.shape[-1] == 0 or topk_tokens == 0:
+            return raw_topk_indices
+
+        if seq_lens.ndim == 2:
+            assert seq_lens.shape == (batch_size, next_n)
+            index_end_pos = seq_lens.reshape(-1).unsqueeze(1) - 1
+        else:
+            assert seq_lens.ndim == 1
+            row_indices = torch.arange(padded_num_tokens, device=device) // next_n
+            next_n_offset = torch.arange(padded_num_tokens, device=device) % next_n
+            index_end_pos = (seq_lens[row_indices] - next_n + next_n_offset).unsqueeze(1)
+
         positions = (
             torch.arange(logits.shape[-1], device=device)
             .unsqueeze(0)
             .expand(batch_size * next_n, -1)
         )
-        row_indices = torch.arange(padded_num_tokens, device=device) // next_n
-        next_n_offset = torch.arange(padded_num_tokens, device=device) % next_n
-        index_end_pos = (seq_lens[row_indices] - next_n + next_n_offset).unsqueeze(1)
         # index_end_pos: [B * N, 1]
         mask = positions <= index_end_pos
         # mask: [B * N, L]
@@ -679,14 +692,15 @@ class xpu_ops:
         # that is out of range(masked already)
         # this will happen if context length is shorter than K
         topk_indices[topk_indices > index_end_pos] = -1
-        raw_topk_indices[: topk_indices.shape[0], : topk_indices.shape[1]] = (
+        raw_topk_indices[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
             topk_indices
         )
+        return raw_topk_indices
 
     @staticmethod
     def register_ops_once() -> None:
-        global _OPS_REGISTERED
-        if not _OPS_REGISTERED:
+        global _ops_registered
+        if not _ops_registered:
             # register all the custom ops here
             direct_register_custom_op(
                 op_name="xpu_ops_deepseek_scaling_rope",

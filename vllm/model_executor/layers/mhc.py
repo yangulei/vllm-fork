@@ -38,14 +38,11 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     return split_k
 
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-    },
-)
-def mhc_pre_big_fuse_tilelang(
+def _mhc_pre_big_fuse_tilelang_unavailable(*args, **kwargs):
+    raise RuntimeError("mhc_pre_big_fuse_tilelang requires tilelang (CUDA-only).")
+
+
+def _mhc_pre_big_fuse_impl(
     gemm_out_mul,
     gemm_out_sqrsum,
     hc_scale,
@@ -178,6 +175,18 @@ def mhc_pre_big_fuse_tilelang(
         T.pdl_trigger()
 
 
+if tilelang is None:
+    mhc_pre_big_fuse_tilelang = _mhc_pre_big_fuse_tilelang_unavailable
+else:
+    mhc_pre_big_fuse_tilelang = tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        },
+    )(_mhc_pre_big_fuse_impl)
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -210,6 +219,23 @@ def mhc_pre(
         comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
     """
+
+    if current_platform.is_xpu():
+        from vllm.v1.attention.ops.deepseek_v4_ops.mhc_xpu import (
+            mhc_pre_xpu_torch,
+        )
+
+        return mhc_pre_xpu_torch(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
 
     # Validate shapes
     assert residual.dtype == torch.bfloat16
@@ -382,14 +408,7 @@ def _mhc_pre_fake(
     return post_mix, comb_mix, layer_input
 
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-    },
-)
-def mhc_post_tilelang(
+def _mhc_post_impl(
     a,
     b,
     c,
@@ -399,7 +418,7 @@ def mhc_post_tilelang(
     hidden: int,
     n_thr: int = 128,
     h_blk: int = 1024,
-) -> tilelang.JITKernel:
+):
     # rename for shorter code
     n = T.dynamic("num_tokens")
     h = hidden
@@ -441,6 +460,22 @@ def mhc_post_tilelang(
         T.pdl_trigger()
 
 
+def _mhc_post_tilelang_unavailable(*args, **kwargs):
+    raise RuntimeError("mhc_post_tilelang requires tilelang (CUDA-only).")
+
+
+if tilelang is None:
+    mhc_post_tilelang = _mhc_post_tilelang_unavailable
+else:
+    mhc_post_tilelang = tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        },
+    )(_mhc_post_impl)
+
+
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -455,6 +490,14 @@ def mhc_post(
         )
         post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
         return (mixed_residual + post_term).to(residual.dtype)
+
+    if current_platform.is_xpu():
+        from vllm.v1.attention.ops.deepseek_v4_ops.mhc_xpu import (
+            mhc_post_xpu_torch,
+        )
+
+        return mhc_post_xpu_torch(x, residual, post_layer_mix, comb_res_mix)
+
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,

@@ -73,9 +73,16 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # determines the SWA block size of 64 tokens per block.
         # TODO(yifan): make SWA block size automatically determined and configurable.
         self.block_size = 64
-        assert self.dtype == torch.uint8
+        from vllm.platforms import current_platform
+
+        if current_platform.is_xpu():
+            assert self.dtype == torch.bfloat16
+        else:
+            assert self.dtype == torch.uint8
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm.platforms import current_platform
+        alignment = 512 if current_platform.is_xpu() else 576
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -83,7 +90,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            alignment=576,  # NOTE: FlashMLA requires 576B alignment
+            alignment=alignment,
             model_version="deepseek_v4",
         )
 
@@ -362,6 +369,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C128A: None,
         }
         if num_decode_tokens == 0 or current_platform.is_rocm():
+            return out
+        from vllm.platforms import current_platform
+
+        if current_platform.is_xpu():
+            # XPU does not use FlashMLA; the Triton sparse-decode kernel
+            # (Phase E) reads only block_table + decode_swa_indices and
+            # ignores tile_scheduler_metadata. Return all-None.
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
