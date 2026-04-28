@@ -947,9 +947,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     out=output,
                 )
             else:
-                assert self.compress_ratio == 4, (
-                    "XPU only supports compress_ratio=4 for non-SWA decode, "
-                    f"got {self.compress_ratio}"
+                # The c4_sparse_decode_bf16 kernel is generic over slot indices
+                # (gather + online-softmax + SWA dedup + sink), so it is reused
+                # for both C4A and C128A. The dispatch above already selected
+                # topk_indices/topk_lens from the right source per ratio:
+                #   C4A   -> Indexer-filled topk_indices_buffer (top-k sparse)
+                #   C128A -> attn_metadata.c128a_global_decode_topk_indices
+                #            (dense over the compressed pool: every valid
+                #             compressed entry, length = (pos+1)//128)
+                assert self.compress_ratio in (4, 128), (
+                    "XPU only supports compress_ratio in (4, 128) for "
+                    f"non-SWA decode, got {self.compress_ratio}"
                 )
                 assert kv_cache is not None
                 assert topk_indices is not None and topk_lens is not None
@@ -958,7 +966,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     "c4_sparse_decode_bf16"
                 ).c4_sparse_decode_bf16
 
-                logger.info_once("XPU: C4 sparse decode kernel dispatched")
+                logger.info_once(
+                    "XPU: compressed sparse decode kernel dispatched "
+                    "(compress_ratio=%d)",
+                    self.compress_ratio,
+                )
                 kv_flat = kv_cache.view(-1, kv_cache.shape[-1])
                 topk_idx_2d = (
                     topk_indices.squeeze(1)
@@ -1074,11 +1086,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if swa_only:
                 self._forward_prefill_xpu_bf16(q, swa_k_cache, output, swa_metadata)
             else:
-                assert self.compress_ratio == 4, (
-                    "XPU only supports compress_ratio=4 for non-SWA prefill, "
-                    f"got {self.compress_ratio}"
+                assert self.compress_ratio in (4, 128), (
+                    "XPU only supports compress_ratio in (4, 128) for "
+                    f"non-SWA prefill, got {self.compress_ratio}"
                 )
-                self._forward_prefill_xpu_c4_bf16(
+                self._forward_prefill_xpu_compressed_bf16(
                     q,
                     compressed_k_cache,
                     swa_k_cache,
@@ -1301,7 +1313,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 out=output[query_start:query_end],
             )
 
-    def _forward_prefill_xpu_c4_bf16(
+    def _forward_prefill_xpu_compressed_bf16(
         self,
         q: torch.Tensor,
         compressed_k_cache: torch.Tensor | None,
@@ -1310,6 +1322,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
+        # Drives c4_sparse_prefill_bf16 for any compress_ratio in (4, 128).
+        # The kernel is generic over slot indices; ratio only changes the
+        # topk_indices source:
+        #   C4A   -> Indexer-filled topk_indices_buffer  (sparse top-k)
+        #   C128A -> attn_metadata.c128a_prefill_topk_indices
+        #            (dense local indices [0..n-1, -1, ...] over compressed pool)
+        # XPU divergence vs CUDA: prefill does not fold attn_sink (CUDA does
+        # via flash_mla_sparse_fwd). Pre-existing for C4; inherited by C128.
+        from vllm.v1.attention.ops.deepseek_v4_ops.gather_k_cache_bf16 import (
+            xpu_v4_gather_k_cache_bf16,
+        )
+
         c4_sparse_prefill_bf16 = import_module(
             "vllm.v1.attention.ops.deepseek_v4_ops."
             "c4_sparse_prefill_bf16"
@@ -1317,9 +1341,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         assert attn_metadata is not None
         assert compressed_k_cache is not None
-        assert self.compress_ratio == 4
+        assert self.compress_ratio in (4, 128)
 
-        logger.info_once("XPU: C4 sparse prefill kernel dispatched")
+        logger.info_once(
+            "XPU: compressed sparse prefill kernel dispatched "
+            "(compress_ratio=%d)",
+            self.compress_ratio,
+        )
 
         num_prefills = swa_metadata.num_prefills
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -1337,9 +1365,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         assert query_start_loc is not None
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
-        assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[num_decode_tokens:]
-        topk_indices = topk_indices[:num_prefill_tokens]
+        if self.compress_ratio == 4:
+            assert self.topk_indices_buffer is not None
+            topk_indices = self.topk_indices_buffer[num_decode_tokens:]
+            topk_indices = topk_indices[:num_prefill_tokens]
+        else:
+            assert attn_metadata.c128a_prefill_topk_indices is not None
+            topk_indices = attn_metadata.c128a_prefill_topk_indices
+
         top_k = topk_indices.shape[-1]
         N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
         M = N + self.window_size + self.max_num_batched_tokens
@@ -1355,10 +1388,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
 
+            # XPU compressed-KV cache is plain bf16 (forced at layer init), so
+            # dequantize_and_gather_k_cache (FP8 ds_mla: 448 fp8+64 bf16+8 scale)
+            # is the wrong layout here -- use the bf16 paged gather.
             block_table = attn_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                compressed_k_cache,
+            xpu_v4_gather_k_cache_bf16(
+                out=kv[:chunk_size],
+                k_cache=compressed_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
                 gather_lens=None,
                 block_table=block_table[chunk_start:chunk_end],
@@ -1367,9 +1403,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
+            xpu_v4_gather_k_cache_bf16(
+                out=kv[:chunk_size],
+                k_cache=swa_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end],
                 gather_lens=gather_lens[chunk_start:chunk_end],
                 block_table=swa_block_table[chunk_start:chunk_end],
