@@ -1,23 +1,28 @@
 #!/usr/bin/env python
-"""Run DeepSeek-V4-Flash on Intel XPU (BMG Arc Pro B60, ~24GB) offline and print output.
+"""Run DeepSeek-V4-Flash on Intel XPU offline and print output.
 
-Python port of run_vllm_dsv4_flash.sh — uses vllm.LLM.generate() directly so you
-can observe the model's output inline (no HTTP server, no client).
+Two modes:
 
-Strategy: Override num_hidden_layers via hf_overrides so vLLM builds a smaller
-model. The HF safetensors checkpoint (43 layers) loads only the layers the model
-instantiates; extra layers in the checkpoint are simply unused by vLLM's loader.
-compress_ratios MUST be truncated to match num_hidden_layers (the model indexes
-compress_ratios[layer_id] directly — see vllm/model_executor/models/deepseek_v4.py:845).
+1. Truncated harness (default, N_LAYERS=4, fits ~24GB BMG):
+   Builds a 4-layer cut-down model via hf_overrides. Output is gibberish by
+   construction (the bulk of language modeling lives in layers 4..42), but all
+   XPU sparse kernel paths are exercised. Default compress_ratios=[0,0,4,128]
+   hits both C4 (Indexer top-k) and C128 (heavily-compressed) paths.
 
-Layer budget: per-layer ~3.69GB (FP4 MoE dominates). With 24GB HBM and ~2GB
-overhead, ~5 layers fit. Default is 4 layers using compress_ratios=[0,0,4,0]:
-  layer 2 → C4 (exercises M5/M6/M7 kernels), layer 3 → SWA-only
-  (C128 not yet XPU-ported; once ported, use [0,0,4,128]).
+2. Full model (FULL=1 or N_LAYERS=43): keeps the checkpoint's native
+   num_hidden_layers=43 and compress_ratios; produces real output. Requires
+   sufficient HBM (multi-GPU or larger device) — per-layer ~3.69GB.
+
+Prompt: at compress_ratio=128, seq_len >= 128 is needed to attend to even one
+compressed entry. The default prompt comfortably exceeds this.
 
 Usage:
-  python run_vllm_dsv4_flash.py
-  N_LAYERS=2 python run_vllm_dsv4_flash.py
+  python run_vllm_dsv4_flash.py                 # 4-layer harness, [0,0,4,128]
+  FULL=1 python run_vllm_dsv4_flash.py          # full 43-layer model
+  FULL=1 TP=8 python run_vllm_dsv4_flash.py     # full model with explicit TP
+  N_LAYERS=43 python run_vllm_dsv4_flash.py     # same as FULL=1
+  N_LAYERS=8 python run_vllm_dsv4_flash.py      # custom truncation
+  COMPRESS_RATIOS='[0,0,4,128]' N_LAYERS=4 python run_vllm_dsv4_flash.py
   PROMPT="Your question here" python run_vllm_dsv4_flash.py
 """
 
@@ -28,44 +33,92 @@ import os
 import sys
 
 # Env vars must be set BEFORE importing vllm/torch.
-os.environ.setdefault("ZE_AFFINITY_MASK", "0")
-os.environ.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+# os.environ.setdefault("ZE_AFFINITY_MASK", "0")
+# os.environ.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
+# os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
 MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V4-Flash")
-N_LAYERS = int(os.environ.get("N_LAYERS", "4"))
 
-# compress_ratios MUST have length == num_hidden_layers; the model indexes
-# compress_ratios[layer_id] directly (deepseek_v4.py:845). Original full-model
-# array is [0, 0, 4, 128, 4, 128, ...] length 44 (43 layers + 1 MTP).
+# Native checkpoint topology (DeepSeek-V4-Flash config.json):
+#   num_hidden_layers=43, num_nextn_predict_layers=1 (MTP),
+#   compress_ratios length = 44 (= 43 + 1 MTP).
+FULL_NUM_HIDDEN_LAYERS = 43
+FULL_NUM_NEXTN_PREDICT_LAYERS = 1
+FULL_COMPRESS_RATIOS = [
+    0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0,
+]
+assert len(FULL_COMPRESS_RATIOS) == FULL_NUM_HIDDEN_LAYERS + FULL_NUM_NEXTN_PREDICT_LAYERS
+
+FULL = os.environ.get("FULL", "0") == "1"
+N_LAYERS = int(os.environ.get("N_LAYERS", str(FULL_NUM_HIDDEN_LAYERS if FULL else 4)))
+FULL = FULL or N_LAYERS == FULL_NUM_HIDDEN_LAYERS
+
+# compress_ratios MUST have length == num_hidden_layers + num_nextn_predict_layers;
+# the model indexes compress_ratios[layer_id] directly (deepseek_v4.py).
+# In FULL mode we leave it unset so vLLM picks it up from the checkpoint config.
 _compress_env = os.environ.get("COMPRESS_RATIOS")
+COMPRESS_RATIOS: list[int] | None
 if _compress_env:
     COMPRESS_RATIOS = json.loads(_compress_env)
+    NUM_NEXTN = int(os.environ.get("NUM_NEXTN", "0"))
+elif FULL:
+    COMPRESS_RATIOS = None
+    NUM_NEXTN = FULL_NUM_NEXTN_PREDICT_LAYERS
 elif N_LAYERS == 4:
-    # layer 2 → C4 (M5/M6/M7 kernels); layer 3 → SWA-only (C128 not yet XPU-ported).
-    COMPRESS_RATIOS = [0, 0, 4, 0]
+    # layer 2 → C4 (Indexer top-k); layer 3 → C128 (heavily-compressed attention).
+    COMPRESS_RATIOS = [0, 0, 4, 128]
+    NUM_NEXTN = 0
 else:
     COMPRESS_RATIOS = [0] * N_LAYERS
+    NUM_NEXTN = 0
 
-assert len(COMPRESS_RATIOS) == N_LAYERS, (
-    f"len(COMPRESS_RATIOS)={len(COMPRESS_RATIOS)} must equal N_LAYERS={N_LAYERS}"
+if COMPRESS_RATIOS is not None:
+    assert len(COMPRESS_RATIOS) == N_LAYERS + NUM_NEXTN, (
+        f"len(COMPRESS_RATIOS)={len(COMPRESS_RATIOS)} must equal "
+        f"N_LAYERS + NUM_NEXTN = {N_LAYERS} + {NUM_NEXTN} = {N_LAYERS + NUM_NEXTN}"
+    )
+
+HF_OVERRIDES: dict[str, object] = {}
+if COMPRESS_RATIOS is not None:
+    HF_OVERRIDES["compress_ratios"] = COMPRESS_RATIOS
+if not FULL:
+    # Truncated harness: shrink the model to fit a single small device.
+    HF_OVERRIDES["num_hidden_layers"] = N_LAYERS
+    HF_OVERRIDES["num_nextn_predict_layers"] = NUM_NEXTN
+
+DEFAULT_PROMPT = (
+    "You are a careful math tutor. A student asks the following question and "
+    "you must answer it with a clear, step-by-step explanation that a high "
+    "school student can follow. Show every intermediate step, name the "
+    "arithmetic property used at each step, double-check the result with a "
+    "different method, and finally state the answer on its own line prefixed "
+    "with 'Answer:'.\n\n"
+    "Question: Compute 12 * 13 by hand. First decompose 13 into 10 + 3 and "
+    "use the distributive property of multiplication over addition. Then "
+    "verify the result by computing 12 * 13 a second way: decompose 12 into "
+    "6 + 6 and use distribution again. Compare the two results, note that "
+    "they must agree because multiplication of integers is commutative and "
+    "associative, and explain in one sentence why these properties guarantee "
+    "the agreement. Finally, sanity-check by estimating: 12 is close to 10 "
+    "and 13 is close to 10, so the answer should be near 100 but a bit "
+    "larger; confirm your computed value falls in that range."
 )
-
-HF_OVERRIDES = {
-    "num_hidden_layers": N_LAYERS,
-    "compress_ratios": COMPRESS_RATIOS,
-    "num_nextn_predict_layers": 0,
-}
-
-DEFAULT_PROMPT = "What is 12 * 13? Think step by step, then give the final answer."
 PROMPT = os.environ.get("PROMPT", DEFAULT_PROMPT)
+
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "4096"))
+GPU_MEM_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.85"))
+tp_env = os.environ.get("TP")
+TP_SIZE = int(tp_env) if tp_env is not None else (8 if FULL else 1)
 
 print("=== DeepSeek-V4-Flash XPU launch (offline) ===")
 print(f"Model:         {MODEL}")
-print(f"n_layers:      {N_LAYERS}  (full model = 43)")
+print(f"mode:          {'FULL (43 layers)' if FULL else f'truncated harness ({N_LAYERS} layers)'}")
 print(f"hf-overrides:  {json.dumps(HF_OVERRIDES)}")
+print(f"max_model_len: {MAX_MODEL_LEN}, tp_size: {TP_SIZE}, gpu_mem_util: {GPU_MEM_UTIL}")
 print(f"prompt:        {PROMPT!r}")
 print("==============================================")
 sys.stdout.flush()
@@ -83,13 +136,13 @@ def main() -> None:
         trust_remote_code=True,
         dtype="bfloat16",
         kv_cache_dtype="auto",
-        max_model_len=4096,
+        max_model_len=MAX_MODEL_LEN,
         max_num_seqs=1,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=GPU_MEM_UTIL,
         enforce_eager=True,
         enable_prefix_caching=False,
         distributed_executor_backend="mp",
-        tensor_parallel_size=1,
+        tensor_parallel_size=TP_SIZE,
     )
 
     sampling = SamplingParams(

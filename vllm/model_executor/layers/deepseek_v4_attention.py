@@ -205,6 +205,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Pick fp8_einsum recipe based on GPU arch:
         # SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128
         # SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1
+
         if current_platform.is_xpu():
             self._einsum_recipe = (1, 128, 128)
             self._tma_aligned_scales = False
@@ -236,9 +237,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
-        from vllm.utils.platform_streams import make_event
-
-        self.ln_events = [make_event() for _ in range(4)]
+        self.ln_events = [current_platform.Event() for _ in range(4)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         swa_cache_dtype = torch.bfloat16 if current_platform.is_xpu() else torch.uint8
