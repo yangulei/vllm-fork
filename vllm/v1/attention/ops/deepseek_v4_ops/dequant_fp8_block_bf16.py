@@ -72,7 +72,9 @@ def dequant_fp8_block128_to_bf16(
 ) -> torch.Tensor:
     assert fp8_weight.dtype == torch.float8_e4m3fn
     if scale.dtype == torch.float8_e8m0fnu:
-        scale = torch.exp2(scale.to(torch.float32) - 127.0)
+        # E8M0 stores raw exponent byte; value = 2^(byte - 127).
+        # .to(float32) performs semantic conversion, so use .view(uint8) first.
+        scale = torch.exp2(scale.view(torch.uint8).to(torch.float32) - 127.0)
     assert scale.dtype == torch.float32
     assert fp8_weight.ndim == 3
     G, O_dim, R_dim = fp8_weight.shape

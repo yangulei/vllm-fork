@@ -33,11 +33,11 @@ import os
 import sys
 
 # Env vars must be set BEFORE importing vllm/torch.
-# os.environ.setdefault("ZE_AFFINITY_MASK", "0")
+# os.environ.setdefault("ZE_AFFINITY_MASK", "4,5,6,7")
 # os.environ.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
 # os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 # os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
+# os.environ.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
 
 MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 
@@ -66,14 +66,15 @@ if _compress_env:
     COMPRESS_RATIOS = json.loads(_compress_env)
     NUM_NEXTN = int(os.environ.get("NUM_NEXTN", "0"))
 elif FULL:
+    # Use checkpoint's default compress_ratios, just disable MTP.
     COMPRESS_RATIOS = None
-    NUM_NEXTN = FULL_NUM_NEXTN_PREDICT_LAYERS
+    NUM_NEXTN = 0
 elif N_LAYERS == 4:
     # layer 2 → C4 (Indexer top-k); layer 3 → C128 (heavily-compressed attention).
     COMPRESS_RATIOS = [0, 0, 4, 128]
     NUM_NEXTN = 0
 else:
-    COMPRESS_RATIOS = [0] * N_LAYERS
+    COMPRESS_RATIOS = FULL_COMPRESS_RATIOS[0:N_LAYERS]
     NUM_NEXTN = 0
 
 if COMPRESS_RATIOS is not None:
@@ -88,7 +89,7 @@ if COMPRESS_RATIOS is not None:
 if not FULL:
     # Truncated harness: shrink the model to fit a single small device.
     HF_OVERRIDES["num_hidden_layers"] = N_LAYERS
-    HF_OVERRIDES["num_nextn_predict_layers"] = NUM_NEXTN
+HF_OVERRIDES["num_nextn_predict_layers"] = NUM_NEXTN
 
 DEFAULT_PROMPT = (
     "You are a careful math tutor. A student asks the following question and "
@@ -146,25 +147,15 @@ def main() -> None:
     )
 
     sampling = SamplingParams(
-        temperature=float(os.environ.get("TEMPERATURE", "0.7")),
-        top_p=float(os.environ.get("TOP_P", "0.95")),
+        temperature=float(os.environ.get("TEMPERATURE", "0")),
+        top_p=float(os.environ.get("TOP_P", "1")),
         max_tokens=int(os.environ.get("MAX_TOKENS", "512")),
     )
 
-    # Try to apply the model's chat template if available; fall back to raw prompt.
-    try:
-        tokenizer = llm.get_tokenizer()
-        formatted = tokenizer.apply_chat_template(
-            [{"role": "user", "content": PROMPT}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] chat template unavailable ({e}); using raw prompt.")
-        formatted = PROMPT
+    messages = [{"role": "user", "content": PROMPT}]
 
     print("\n--- generating ---")
-    outputs = llm.generate([formatted], sampling)
+    outputs = llm.chat(messages, sampling_params=sampling)
 
     print("\n=== MODEL OUTPUT ===")
     for out in outputs:

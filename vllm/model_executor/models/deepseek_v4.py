@@ -1123,6 +1123,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
+
         self.hc_post_alpha = 2.0
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
@@ -1393,6 +1394,7 @@ class DeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
+
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -1514,7 +1516,8 @@ class DeepseekV4Model(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
 
-@torch.compile(backend=current_platform.simple_compile_backend)
+@torch.compile(backend=current_platform.simple_compile_backend,
+             disable=current_platform.is_xpu())
 def hc_head(
     hidden_states: torch.Tensor,
     hc_fn: torch.Tensor,

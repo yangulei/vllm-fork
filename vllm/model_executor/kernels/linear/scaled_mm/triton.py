@@ -204,8 +204,10 @@ class XPUTritonFp8BlockScaledMMKernel(TritonFp8BlockScaledMMKernel):
         # triton-xpu's dtype canonicalisation table lacks float8_e8m0fnu.
         # E8M0 stores only the FP exponent: value = 2^(byte - 127).
         # Decode to float32 before dispatch so the kernel sees a numeric scale.
+        # NOTE: .to(float32) performs semantic conversion (byte → 2^(byte-127)),
+        # so we must use .view(uint8) to get raw exponent bytes first.
         if Bs.dtype == torch.float8_e8m0fnu:
-            Bs = torch.exp2(Bs.to(torch.float32) - 127.0)
+            Bs = torch.exp2(Bs.view(torch.uint8).to(torch.float32) - 127.0)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,

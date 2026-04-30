@@ -25,6 +25,7 @@ BLOCK_K = 64
 def _c4_sparse_decode_bf16_kernel(
     q_ptr,
     kv_ptr,
+    swa_kv_ptr,
     topk_indices_ptr,
     topk_lens_ptr,
     swa_indices_ptr,
@@ -35,6 +36,7 @@ def _c4_sparse_decode_bf16_kernel(
     q_stride_t,
     q_stride_h,
     kv_stride_s,
+    swa_kv_stride_s,
     topk_stride_t,
     swa_stride_t,
     out_stride_t,
@@ -116,7 +118,7 @@ def _c4_sparse_decode_bf16_kernel(
         block_has_values = valid_count > 0
 
         k = tl.load(
-            kv_ptr + slot[:, None] * kv_stride_s + d_off[None, :],
+            swa_kv_ptr + slot[:, None] * swa_kv_stride_s + d_off[None, :],
             mask=valid[:, None],
             other=0.0,
         ).to(tl.float32)
@@ -159,10 +161,12 @@ def _ref_c4_sparse_decode(
     swa_lens: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    swa_kv_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     T, H, D = q.shape
     out = torch.zeros((T, H, D), dtype=torch.float32, device=q.device)
     kv_f32 = kv_cache.to(torch.float32)
+    swa_kv_f32 = (swa_kv_cache if swa_kv_cache is not None else kv_cache).to(torch.float32)
     q_f32 = q.to(torch.float32)
     sink_f32 = attn_sink.to(torch.float32)
 
@@ -189,7 +193,7 @@ def _ref_c4_sparse_decode(
                 slot = int(swa_indices[t, i].item())
                 if slot < 0 or slot in topk_valid:
                     continue
-                kv_vec = kv_f32[slot]
+                kv_vec = swa_kv_f32[slot]
                 logits.append(float(softmax_scale * torch.dot(q_vec, kv_vec).item()))
                 vals.append(kv_vec)
 
@@ -222,6 +226,7 @@ def c4_sparse_decode_bf16(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor,
+    swa_kv_cache: torch.Tensor | None = None,
 ) -> None:
     assert q.dtype == torch.bfloat16
     assert kv_cache.dtype == torch.bfloat16
@@ -260,10 +265,15 @@ def c4_sparse_decode_bf16(
     T, H, D = q.shape
     topk_max = topk_indices.shape[1]
     swa_w = swa_indices.shape[1]
+
+    # Use separate SWA KV cache if provided (XPU: caches are separate tensors)
+    swa_kv = swa_kv_cache if swa_kv_cache is not None else kv_cache
+
     grid = (T, H)
     _c4_sparse_decode_bf16_kernel[grid](
         q,
         kv_cache,
+        swa_kv,
         topk_indices,
         topk_lens,
         swa_indices,
@@ -274,6 +284,7 @@ def c4_sparse_decode_bf16(
         q.stride(0),
         q.stride(1),
         kv_cache.stride(0),
+        swa_kv.stride(0),
         topk_indices.stride(0),
         swa_indices.stride(0),
         out.stride(0),

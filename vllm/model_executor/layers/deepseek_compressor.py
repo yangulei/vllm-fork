@@ -438,15 +438,13 @@ def _save_partial_states_kernel(
     token_idx = tl.program_id(0)
     slot_id = tl.load(slot_mapping_ptr + token_idx)
 
-    # Skip padded / invalid tokens (slot_id == -1 is the PAD sentinel used
-    # by vLLM).  During CUDA graph replay the batch may contain padding
-    # tokens whose slot_mapping is -1; writing to kv_state[-1] would be an
-    # illegal memory access.
-    if slot_id < 0:
-        return
+    # Guard: only store for valid tokens (slot_id >= 0)
+    valid = slot_id >= 0
+    # Use slot 0 as safe fallback for pointer arithmetic (won't be stored)
+    safe_slot = tl.where(valid, slot_id, tl.zeros_like(slot_id))
 
-    block_idx = slot_id // block_size
-    pos_in_block = slot_id % block_size
+    block_idx = safe_slot // block_size
+    pos_in_block = safe_slot % block_size
     base_ptr = (
         state_cache_ptr
         + block_idx * state_cache_stride0
@@ -454,16 +452,19 @@ def _save_partial_states_kernel(
     )
 
     block = tl.arange(0, TRITON_BLOCK_SIZE)
-    mask = block < HEAD_SIZE
+    mask = (block < HEAD_SIZE) & valid
 
-    kv = tl.load(kv_ptr + token_idx * kv_stride + block, mask=mask)
+    kv = tl.load(kv_ptr + token_idx * kv_stride + block, mask=block < HEAD_SIZE,
+                 other=0.0)
     tl.store(base_ptr + block, kv, mask=mask)
 
     # Fused: score += ape[position % compress_ratio]
     position = tl.load(positions_ptr + token_idx)
     ape_row = position % COMPRESS_RATIO
-    ape = tl.load(ape_ptr + ape_row * ape_stride + block, mask=mask)
-    score = tl.load(score_ptr + token_idx * score_stride + block, mask=mask)
+    ape = tl.load(ape_ptr + ape_row * ape_stride + block, mask=block < HEAD_SIZE,
+                  other=0.0)
+    score = tl.load(score_ptr + token_idx * score_stride + block,
+                    mask=block < HEAD_SIZE, other=0.0)
     tl.store(
         base_ptr + STATE_WIDTH + block,
         score + ape,

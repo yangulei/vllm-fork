@@ -47,6 +47,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         )
         self.is_fp8 = False
         self.is_mxfp4 = False
+        self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -148,6 +149,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             output=output,
             is_fp8=self.is_fp8,
             is_mxfp4=self.is_mxfp4,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
         )
 
 

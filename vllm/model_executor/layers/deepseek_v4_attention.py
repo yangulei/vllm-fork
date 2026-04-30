@@ -345,6 +345,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 nope_dim=self.nope_head_dim,
                 rope_dim=self.rope_head_dim,
             )
+
             wo_a_w = self.wo_a.weight
             wo_a_s = self.wo_a.weight_scale_inv
             G = self.n_local_groups
@@ -352,8 +353,13 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 wo_a_w = wo_a_w.view(G, wo_a_w.shape[0] // G, wo_a_w.shape[1])
                 wo_a_s = wo_a_s.view(G, wo_a_s.shape[0] // G, wo_a_s.shape[1])
             wo_a_bf16 = dequant_fp8_block128_to_bf16(wo_a_w, wo_a_s, block=128)
-            z = torch.einsum("tgr,gor->tgo", o_bf16, wo_a_bf16)
-            return self.wo_b(z.flatten(1))
+
+            z = torch.einsum("tgr,gor->tgo", o_bf16.float(),
+                            wo_a_bf16.float()).to(o_bf16.dtype)
+
+            result = self.wo_b(z.flatten(1))
+
+            return result
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
@@ -971,6 +977,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     self.compress_ratio,
                 )
                 kv_flat = kv_cache.view(-1, kv_cache.shape[-1])
+
                 topk_idx_2d = (
                     topk_indices.squeeze(1)
                     if topk_indices.dim() == 3
@@ -981,6 +988,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     if swa_indices.dim() == 3
                     else swa_indices
                 )
+                swa_kv_flat = self.swa_cache_layer.kv_cache.view(-1, kv_cache.shape[-1])
                 c4_sparse_decode_bf16(
                     q=q,
                     kv_cache=kv_flat,
@@ -991,6 +999,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     attn_sink=self.attn_sink.to(torch.float32),
                     softmax_scale=self.scale,
                     out=output,
+                    swa_kv_cache=swa_kv_flat,
                 )
             return
 
