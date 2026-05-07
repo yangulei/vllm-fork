@@ -950,31 +950,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     out=output,
                 )
             else:
-                # The c4_sparse_decode_bf16 kernel is generic over slot indices
-                # (gather + online-softmax + SWA dedup + sink), so it is reused
-                # for both C4A and C128A. The dispatch above already selected
-                # topk_indices/topk_lens from the right source per ratio:
-                #   C4A   -> Indexer-filled topk_indices_buffer (top-k sparse)
-                #   C128A -> attn_metadata.c128a_global_decode_topk_indices
-                #            (dense over the compressed pool: every valid
-                #             compressed entry, length = (pos+1)//128)
+                # CUTLASS paged decode path: gather sparse KV into paged
+                # format then use DPAS-accelerated flash attention.
                 assert self.compress_ratio in (4, 128), (
                     "XPU only supports compress_ratio in (4, 128) for "
                     f"non-SWA decode, got {self.compress_ratio}"
                 )
                 assert kv_cache is not None
                 assert topk_indices is not None and topk_lens is not None
-                c4_sparse_decode_bf16 = import_module(
-                    "vllm.v1.attention.ops.deepseek_v4_ops."
-                    "c4_sparse_decode_bf16"
-                ).c4_sparse_decode_bf16
+
+                from vllm.v1.attention.ops.deepseek_v4_ops.cutlass_sparse_decode import (  # noqa: E501
+                    xpu_cutlass_sparse_decode,
+                )
 
                 logger.info_once(
-                    "XPU: compressed sparse decode kernel dispatched "
+                    "XPU: CUTLASS paged decode dispatched "
                     "(compress_ratio=%d)",
                     self.compress_ratio,
                 )
-                kv_flat = kv_cache.view(-1, kv_cache.shape[-1])
 
                 topk_idx_2d = (
                     topk_indices.squeeze(1)
@@ -986,18 +979,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     if swa_indices.dim() == 3
                     else swa_indices
                 )
-                swa_kv_flat = self.swa_cache_layer.kv_cache.view(-1, kv_cache.shape[-1])
-                c4_sparse_decode_bf16(
+
+                xpu_cutlass_sparse_decode(
                     q=q,
-                    kv_cache=kv_flat,
+                    kv_cache=kv_cache,
+                    swa_kv_cache=self.swa_cache_layer.kv_cache,
                     topk_indices=topk_idx_2d,
                     topk_lens=topk_lens,
                     swa_indices=swa_idx_2d,
                     swa_lens=swa_lens,
-                    attn_sink=self.attn_sink.to(torch.float32),
+                    attn_sink=self.attn_sink,
                     softmax_scale=self.scale,
                     out=output,
-                    swa_kv_cache=swa_kv_flat,
                 )
             return
 
