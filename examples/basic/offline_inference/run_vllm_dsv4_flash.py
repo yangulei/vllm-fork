@@ -126,11 +126,16 @@ sys.stdout.flush()
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
+# --- Benchmark mode ---
+# BENCH=1 BATCH=16 INPUT_LEN=2048 python run_vllm_dsv4_flash.py
+BENCH = os.environ.get("BENCH", "0") == "1"
+BATCH_SIZE = int(os.environ.get("BATCH", "1"))
+INPUT_LEN = int(os.environ.get("INPUT_LEN", "512"))
+
 
 def main() -> None:
-    # DeepSeek-V4 ships fp8 weights + fp4 expert weights, but XPU MLA Sparse
-    # backend only supports fp16/bf16 KV cache (xpu_mla_sparse.py). bf16 compute
-    # + auto KV dtype is the only working combo on BMG.
+    max_num_seqs = BATCH_SIZE if BENCH else 1
+
     llm = LLM(
         model=MODEL,
         hf_overrides=HF_OVERRIDES,
@@ -138,7 +143,7 @@ def main() -> None:
         dtype="bfloat16",
         kv_cache_dtype="auto",
         max_model_len=MAX_MODEL_LEN,
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         gpu_memory_utilization=GPU_MEM_UTIL,
         enforce_eager=False,
         enable_prefix_caching=False,
@@ -149,19 +154,46 @@ def main() -> None:
     sampling = SamplingParams(
         temperature=float(os.environ.get("TEMPERATURE", "0")),
         top_p=float(os.environ.get("TOP_P", "1")),
-        max_tokens=int(os.environ.get("MAX_TOKENS", "512")),
+        max_tokens=int(os.environ.get("MAX_TOKENS", "512" if not BENCH else "20")),
     )
 
-    messages = [{"role": "user", "content": PROMPT}]
-
-    print("\n--- generating ---")
-    outputs = llm.chat(messages, sampling_params=sampling)
-
-    print("\n=== MODEL OUTPUT ===")
-    for out in outputs:
-        for completion in out.outputs:
-            print(completion.text)
-    print("====================")
+    if BENCH:
+        # Performance mode: random token IDs as input
+        import random
+        random.seed(42)
+        tokenizer = llm.get_tokenizer()
+        vocab_size = tokenizer.vocab_size or 100000
+        prompts = [
+            {"prompt_token_ids": [random.randint(1, vocab_size - 1)
+                                  for _ in range(INPUT_LEN)]}
+            for _ in range(BATCH_SIZE)
+        ]
+        print(f"\n--- benchmark: batch={BATCH_SIZE}, input_len={INPUT_LEN}, "
+              f"max_tokens={sampling.max_tokens} ---")
+        outputs = llm.generate(
+            prompts=prompts,
+            sampling_params=sampling,
+        )
+        # Print throughput summary
+        total_input = BATCH_SIZE * INPUT_LEN
+        total_output = sum(
+            len(c.token_ids) for o in outputs for c in o.outputs
+        )
+        print(f"\n=== BENCHMARK RESULT ===")
+        print(f"Requests: {BATCH_SIZE}")
+        print(f"Total input tokens: {total_input}")
+        print(f"Total output tokens: {total_output}")
+        print("========================")
+    else:
+        # Correctness mode: single chat query
+        messages = [{"role": "user", "content": PROMPT}]
+        print("\n--- generating ---")
+        outputs = llm.chat(messages, sampling_params=sampling)
+        print("\n=== MODEL OUTPUT ===")
+        for out in outputs:
+            for completion in out.outputs:
+                print(completion.text)
+        print("====================")
 
 
 if __name__ == "__main__":
