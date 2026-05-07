@@ -950,24 +950,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     out=output,
                 )
             else:
-                # CUTLASS paged decode path: gather sparse KV into paged
-                # format then use DPAS-accelerated flash attention.
+                # Adaptive decode kernel dispatch:
+                # - CUTLASS paged decode (DPAS) wins for C128A at all batch
+                #   sizes and for C4A at B>=4 (gather+DPAS beats scalar FMA).
+                # - Triton scalar kernel wins for C4A at B=1 (low KV count,
+                #   no gather overhead).
                 assert self.compress_ratio in (4, 128), (
                     "XPU only supports compress_ratio in (4, 128) for "
                     f"non-SWA decode, got {self.compress_ratio}"
                 )
                 assert kv_cache is not None
                 assert topk_indices is not None and topk_lens is not None
-
-                from vllm.v1.attention.ops.deepseek_v4_ops.cutlass_sparse_decode import (  # noqa: E501
-                    xpu_cutlass_sparse_decode,
-                )
-
-                logger.info_once(
-                    "XPU: CUTLASS paged decode dispatched "
-                    "(compress_ratio=%d)",
-                    self.compress_ratio,
-                )
 
                 topk_idx_2d = (
                     topk_indices.squeeze(1)
@@ -980,18 +973,60 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     else swa_indices
                 )
 
-                xpu_cutlass_sparse_decode(
-                    q=q,
-                    kv_cache=kv_cache,
-                    swa_kv_cache=self.swa_cache_layer.kv_cache,
-                    topk_indices=topk_idx_2d,
-                    topk_lens=topk_lens,
-                    swa_indices=swa_idx_2d,
-                    swa_lens=swa_lens,
-                    attn_sink=self.attn_sink,
-                    softmax_scale=self.scale,
-                    out=output,
-                )
+                # Heuristic: use Triton for small workloads where gather
+                # overhead dominates (C4A, B<=2, short KV).
+                use_triton = (self.compress_ratio == 4
+                              and num_decode_tokens <= 2)
+
+                if use_triton:
+                    c4_sparse_decode_bf16 = import_module(
+                        "vllm.v1.attention.ops.deepseek_v4_ops."
+                        "c4_sparse_decode_bf16"
+                    ).c4_sparse_decode_bf16
+
+                    logger.info_once(
+                        "XPU: Triton sparse decode dispatched "
+                        "(compress_ratio=%d, B<=%d)",
+                        self.compress_ratio, 2,
+                    )
+                    kv_flat = kv_cache.view(-1, kv_cache.shape[-1])
+                    swa_kv_flat = self.swa_cache_layer.kv_cache.view(
+                        -1, kv_cache.shape[-1])
+                    c4_sparse_decode_bf16(
+                        q=q,
+                        kv_cache=kv_flat,
+                        topk_indices=topk_idx_2d,
+                        topk_lens=topk_lens,
+                        swa_indices=swa_idx_2d,
+                        swa_lens=swa_lens,
+                        attn_sink=self.attn_sink.to(torch.float32),
+                        softmax_scale=self.scale,
+                        out=output,
+                        swa_kv_cache=swa_kv_flat,
+                    )
+                else:
+                    from vllm.v1.attention.ops.deepseek_v4_ops.cutlass_sparse_decode import (  # noqa: E501
+                        xpu_cutlass_sparse_decode,
+                    )
+
+                    logger.info_once(
+                        "XPU: CUTLASS paged decode dispatched "
+                        "(compress_ratio=%d)",
+                        self.compress_ratio,
+                    )
+
+                    xpu_cutlass_sparse_decode(
+                        q=q,
+                        kv_cache=kv_cache,
+                        swa_kv_cache=self.swa_cache_layer.kv_cache,
+                        topk_indices=topk_idx_2d,
+                        topk_lens=topk_lens,
+                        swa_indices=swa_idx_2d,
+                        swa_lens=swa_lens,
+                        attn_sink=self.attn_sink,
+                        softmax_scale=self.scale,
+                        out=output,
+                    )
             return
 
         if current_platform.is_rocm():
