@@ -329,21 +329,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             return self.wo_b(z.flatten(1))
 
         if current_platform.is_xpu():
-            from vllm.v1.attention.ops.deepseek_v4_ops.dequant_fp8_block_bf16 import (
-                dequant_fp8_block128_to_bf16,
-            )
-            from vllm.v1.attention.ops.deepseek_v4_ops.inv_rope_bf16 import (
-                xpu_fused_inv_rope_bf16,
-            )
+            # Imports trigger custom op registration
+            import vllm.v1.attention.ops.deepseek_v4_ops.dequant_fp8_block_bf16  # noqa: F401
+            import vllm.v1.attention.ops.deepseek_v4_ops.inv_rope_bf16  # noqa: F401
 
-            o_bf16 = xpu_fused_inv_rope_bf16(
+            o_bf16 = torch.ops.vllm.xpu_fused_inv_rope_bf16(
                 o,
                 positions,
                 self.rotary_emb.cos_sin_cache,
-                n_groups=self.n_local_groups,
-                heads_per_group=self.n_local_heads // self.n_local_groups,
-                nope_dim=self.nope_head_dim,
-                rope_dim=self.rope_head_dim,
+                self.n_local_groups,
+                self.n_local_heads // self.n_local_groups,
+                self.nope_head_dim,
+                self.rope_head_dim,
             )
 
             wo_a_w = self.wo_a.weight
@@ -352,7 +349,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             if wo_a_w.ndim == 2:
                 wo_a_w = wo_a_w.view(G, wo_a_w.shape[0] // G, wo_a_w.shape[1])
                 wo_a_s = wo_a_s.view(G, wo_a_s.shape[0] // G, wo_a_s.shape[1])
-            wo_a_bf16 = dequant_fp8_block128_to_bf16(wo_a_w, wo_a_s, block=128)
+            wo_a_bf16 = torch.ops.vllm.dequant_fp8_block128_to_bf16(
+                wo_a_w, wo_a_s, 128)
 
             z = torch.einsum("tgr,gor->tgo", o_bf16.float(),
                             wo_a_bf16.float()).to(o_bf16.dtype)

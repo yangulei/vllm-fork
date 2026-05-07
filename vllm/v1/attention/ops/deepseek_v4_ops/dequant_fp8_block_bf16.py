@@ -14,6 +14,7 @@ Output:
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit
@@ -104,3 +105,20 @@ def dequant_fp8_block128_to_bf16(
         num_warps=4,
     )
     return out
+
+
+def _dequant_fp8_block128_to_bf16_fake(
+    fp8_weight: torch.Tensor,
+    scale: torch.Tensor,
+    block: int = 128,
+) -> torch.Tensor:
+    G, O_dim, R_dim = fp8_weight.shape
+    return torch.empty((G, O_dim, R_dim), dtype=torch.bfloat16,
+                       device=fp8_weight.device)
+
+
+direct_register_custom_op(
+    "dequant_fp8_block128_to_bf16",
+    dequant_fp8_block128_to_bf16,
+    fake_impl=_dequant_fp8_block128_to_bf16_fake,
+)

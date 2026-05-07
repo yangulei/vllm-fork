@@ -140,7 +140,7 @@ def main() -> None:
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=1,
         gpu_memory_utilization=GPU_MEM_UTIL,
-        enforce_eager=True,
+        enforce_eager=False,
         enable_prefix_caching=False,
         distributed_executor_backend="mp",
         tensor_parallel_size=TP_SIZE,

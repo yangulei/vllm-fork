@@ -11,6 +11,7 @@ pipeline: o (bf16) -> inv_rope -> o_bf16 -> torch.einsum with bf16 wo_a.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit
@@ -115,3 +116,27 @@ def xpu_fused_inv_rope_bf16(
         num_warps=1,
     )
     return out
+
+
+def _xpu_fused_inv_rope_bf16_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+) -> torch.Tensor:
+    num_tokens, num_heads, head_dim = o.shape
+    return torch.empty(
+        (num_tokens, n_groups, heads_per_group * head_dim),
+        dtype=torch.bfloat16,
+        device=o.device,
+    )
+
+
+direct_register_custom_op(
+    "xpu_fused_inv_rope_bf16",
+    xpu_fused_inv_rope_bf16,
+    fake_impl=_xpu_fused_inv_rope_bf16_fake,
+)
