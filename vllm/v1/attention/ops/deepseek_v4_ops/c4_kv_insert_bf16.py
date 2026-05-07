@@ -289,22 +289,33 @@ def c4_kv_insert_bf16(
         )
         return
 
-    # --- WORKAROUND: Use reference implementation (Triton kernel has XPU issues) ---
-    _ref_c4_kv_insert_bf16(
-        state_cache=state_cache,
-        token_to_req_indices=token_to_req_indices,
-        positions=positions,
-        slot_mapping=slot_mapping,
-        block_table=block_table,
-        rms_norm_weight=rms_norm_weight,
-        rms_norm_eps=rms_norm_eps,
-        cos_sin_cache=cos_sin_cache,
-        k_cache=k_cache,
-        kv_slot_mapping=kv_slot_mapping,
-        kv_cache_block_size=kv_cache_block_size,
-        compress_ratio=compress_ratio,
-        overlap=overlap,
-        rope_head_dim=rope_head_dim,
+    num_tokens = positions.numel()
+    state_width = state_cache.shape[-1] // 2
+    _c4_kv_insert_bf16_kernel[(num_tokens,)](
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        state_width,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_table.stride(0),
+        state_cache.shape[1],  # state_cache_block_size
+        rms_norm_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        k_cache,
+        kv_slot_mapping,
+        kv_cache_block_size,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        HEAD_SIZE_C=HEAD_SIZE,
+        TRITON_BLOCK_SIZE_C=TRITON_BLOCK_SIZE,
+        COMPRESS_RATIO=compress_ratio,
+        OVERLAP=overlap,
+        ROPE_HEAD_DIM=rope_head_dim,
     )
 
 
