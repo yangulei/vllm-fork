@@ -24,6 +24,10 @@ Usage:
   N_LAYERS=8 python run_vllm_dsv4_flash.py      # custom truncation
   COMPRESS_RATIOS='[0,0,4,128]' N_LAYERS=4 python run_vllm_dsv4_flash.py
   PROMPT="Your question here" python run_vllm_dsv4_flash.py
+
+  # Benchmark with profiling:
+  BENCH=1 PROFILE=1 BATCH=1 INPUT_LEN=2048 MAX_TOKENS=50 python run_vllm_dsv4_flash.py
+  BENCH=1 PROFILE=1 PROFILE_DIR=./my_trace python run_vllm_dsv4_flash.py
 """
 
 from __future__ import annotations
@@ -110,7 +114,23 @@ DEFAULT_PROMPT = (
 )
 PROMPT = os.environ.get("PROMPT", DEFAULT_PROMPT)
 
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "4096"))
+# --- Benchmark mode ---
+# BENCH=1 BATCH=16 INPUT_LEN=2048 python run_vllm_dsv4_flash.py
+BENCH = os.environ.get("BENCH", "0") == "1"
+BATCH_SIZE = int(os.environ.get("BATCH", "4"))
+INPUT_LEN = int(os.environ.get("INPUT_LEN", "4096"))
+
+PROFILE = os.environ.get("PROFILE", "0") == "1"
+PROFILE_DIR = os.environ.get("PROFILE_DIR", "./dsv4_profile")
+
+# Profiling adds massive overhead on XPU — each model step can take minutes.
+# Set timeouts before vLLM import so they're picked up by envs lazy-eval.
+if PROFILE:
+    os.environ["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = "3600"
+    os.environ["VLLM_RPC_TIMEOUT"] = "3600000"
+    os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "3600"
+
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "16384" if BENCH else "4096"))
 GPU_MEM_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.85"))
 tp_env = os.environ.get("TP")
 TP_SIZE = int(tp_env) if tp_env is not None else (8 if FULL else 1)
@@ -126,15 +146,17 @@ sys.stdout.flush()
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
-# --- Benchmark mode ---
-# BENCH=1 BATCH=16 INPUT_LEN=2048 python run_vllm_dsv4_flash.py
-BENCH = os.environ.get("BENCH", "0") == "1"
-BATCH_SIZE = int(os.environ.get("BATCH", "1"))
-INPUT_LEN = int(os.environ.get("INPUT_LEN", "512"))
-
 
 def main() -> None:
     max_num_seqs = BATCH_SIZE if BENCH else 1
+
+    profiler_kwargs = {}
+    if PROFILE:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        profiler_kwargs["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": PROFILE_DIR,
+        }
 
     llm = LLM(
         model=MODEL,
@@ -149,6 +171,7 @@ def main() -> None:
         enable_prefix_caching=False,
         distributed_executor_backend="mp",
         tensor_parallel_size=TP_SIZE,
+        **profiler_kwargs,
     )
 
     sampling = SamplingParams(
@@ -158,22 +181,34 @@ def main() -> None:
     )
 
     if BENCH:
-        # Performance mode: random token IDs as input
+        # Performance mode using chat API with filler prompt
         import random
         random.seed(42)
+
+        # Generate a filler prompt trimmed to fit within max_model_len.
+        # Reserve space for chat template overhead (~100 tokens) + output.
         tokenizer = llm.get_tokenizer()
-        vocab_size = tokenizer.vocab_size or 100000
-        prompts = [
-            {"prompt_token_ids": [random.randint(1, vocab_size - 1)
-                                  for _ in range(INPUT_LEN)]}
+        max_input_tokens = MAX_MODEL_LEN - sampling.max_tokens - 100
+        target_len = min(INPUT_LEN, max_input_tokens)
+        filler_text = "Please explain step by step. " * (target_len // 3)
+        filler_ids = tokenizer.encode(filler_text)[:target_len]
+        filler = tokenizer.decode(filler_ids)
+        messages_list = [
+            [{"role": "user", "content": filler}]
             for _ in range(BATCH_SIZE)
         ]
-        print(f"\n--- benchmark: batch={BATCH_SIZE}, input_len={INPUT_LEN}, "
-              f"max_tokens={sampling.max_tokens} ---")
-        outputs = llm.generate(
-            prompts=prompts,
-            sampling_params=sampling,
-        )
+        print(f"\n--- benchmark: batch={BATCH_SIZE}, "
+              f"~input_len={INPUT_LEN}, max_tokens={sampling.max_tokens} ---")
+
+        if PROFILE:
+            print(f"Profiling enabled, output dir: {PROFILE_DIR}")
+            llm.start_profile()
+            outputs = llm.chat(messages_list, sampling_params=sampling)
+            llm.stop_profile()
+            print(f"Profile trace saved to {PROFILE_DIR}/")
+        else:
+            outputs = llm.chat(messages_list, sampling_params=sampling)
+
         # Print throughput summary
         total_input = BATCH_SIZE * INPUT_LEN
         total_output = sum(
