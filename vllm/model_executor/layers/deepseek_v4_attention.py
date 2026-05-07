@@ -751,6 +751,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.max_model_len = vllm_config.model_config.max_model_len
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
+        self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
         from vllm.platforms import current_platform
 
@@ -950,11 +951,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     out=output,
                 )
             else:
-                # Adaptive decode kernel dispatch:
-                # - CUTLASS paged decode (DPAS) wins for C128A at all batch
-                #   sizes and for C4A at B>=4 (gather+DPAS beats scalar FMA).
-                # - Triton scalar kernel wins for C4A at B=1 (low KV count,
-                #   no gather overhead).
+                # CUTLASS paged decode (DPAS-accelerated) for all non-SWA
+                # decode. Uses pre-allocated workspace to avoid per-call
+                # tensor allocations.
                 assert self.compress_ratio in (4, 128), (
                     "XPU only supports compress_ratio in (4, 128) for "
                     f"non-SWA decode, got {self.compress_ratio}"
@@ -973,60 +972,37 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     else swa_indices
                 )
 
-                # Heuristic: use Triton for small workloads where gather
-                # overhead dominates (C4A, B<=2, short KV).
-                use_triton = (self.compress_ratio == 4
-                              and num_decode_tokens <= 2)
-
-                if use_triton:
-                    c4_sparse_decode_bf16 = import_module(
-                        "vllm.v1.attention.ops.deepseek_v4_ops."
-                        "c4_sparse_decode_bf16"
-                    ).c4_sparse_decode_bf16
-
-                    logger.info_once(
-                        "XPU: Triton sparse decode dispatched "
-                        "(compress_ratio=%d, B<=%d)",
-                        self.compress_ratio, 2,
-                    )
-                    kv_flat = kv_cache.view(-1, kv_cache.shape[-1])
-                    swa_kv_flat = self.swa_cache_layer.kv_cache.view(
-                        -1, kv_cache.shape[-1])
-                    c4_sparse_decode_bf16(
-                        q=q,
-                        kv_cache=kv_flat,
-                        topk_indices=topk_idx_2d,
-                        topk_lens=topk_lens,
-                        swa_indices=swa_idx_2d,
-                        swa_lens=swa_lens,
-                        attn_sink=self.attn_sink.to(torch.float32),
-                        softmax_scale=self.scale,
-                        out=output,
-                        swa_kv_cache=swa_kv_flat,
-                    )
-                else:
+                # Lazy-init CUTLASS decode state (once per layer)
+                if not hasattr(self, '_cutlass_decode_state'):
                     from vllm.v1.attention.ops.deepseek_v4_ops.cutlass_sparse_decode import (  # noqa: E501
-                        xpu_cutlass_sparse_decode,
+                        CutlassSparseDecodeState,
                     )
-
+                    max_batch = self.max_num_seqs
+                    self._cutlass_decode_state = CutlassSparseDecodeState(
+                        num_heads=q.shape[1],
+                        head_dim=q.shape[2],
+                        max_model_len=self.max_model_len,
+                        max_batch_size=max_batch,
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
                     logger.info_once(
-                        "XPU: CUTLASS paged decode dispatched "
-                        "(compress_ratio=%d)",
-                        self.compress_ratio,
+                        "XPU: CUTLASS paged decode initialized "
+                        "(compress_ratio=%d, max_batch=%d)",
+                        self.compress_ratio, max_batch,
                     )
 
-                    xpu_cutlass_sparse_decode(
-                        q=q,
-                        kv_cache=kv_cache,
-                        swa_kv_cache=self.swa_cache_layer.kv_cache,
-                        topk_indices=topk_idx_2d,
-                        topk_lens=topk_lens,
-                        swa_indices=swa_idx_2d,
-                        swa_lens=swa_lens,
-                        attn_sink=self.attn_sink,
-                        softmax_scale=self.scale,
-                        out=output,
-                    )
+                self._cutlass_decode_state(
+                    q=q,
+                    kv_cache=kv_cache,
+                    swa_kv_cache=self.swa_cache_layer.kv_cache,
+                    topk_indices=topk_idx_2d,
+                    topk_lens=topk_lens,
+                    swa_indices=swa_idx_2d,
+                    swa_lens=swa_lens,
+                    softmax_scale=self.scale,
+                    out=output,
+                )
             return
 
         if current_platform.is_rocm():

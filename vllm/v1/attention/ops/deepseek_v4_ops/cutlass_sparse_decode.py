@@ -4,11 +4,13 @@
 CUTLASS paged decode for DeepSeek V4 sparse attention on XPU.
 
 Strategy:
-  1. Concatenate topk + SWA slot indices (no dedup — minor redundancy is OK).
-  2. Gather KV into paged format [num_blocks, block_size=16, 1, head_dim].
-  3. Split 128 Q heads into 8 groups of 16 (GQA 16:1 is kernel's max ratio).
-  4. Call flash_attn_varlen_func with block_table + seqused_k.
-  5. Merge output back to [B, 128, head_dim].
+  1. Gather topk + SWA KV slots into a pre-allocated paged buffer.
+  2. Split Q heads into GQA groups of 16 (kernel's max ratio).
+  3. Call flash_attn_varlen_func with pre-built block_table + seqused_k.
+
+Performance: all metadata tensors (cu_seqlens_q, block_table) are pre-allocated
+once and reused across decode steps. Only the KV gather (index into cache) and
+seqused_k fill happen per call — zero torch.cat/zeros/arange allocations.
 """
 
 import torch
@@ -22,119 +24,162 @@ _PAGE_SIZE = 16
 _MAX_GQA_RATIO = 16
 
 
-def xpu_cutlass_sparse_decode(
-    q: torch.Tensor,         # [B, num_heads=128, head_dim=512]
-    kv_cache: torch.Tensor,  # [total_slots, head_dim] or [total_slots, 1, hd]
-    swa_kv_cache: torch.Tensor,  # [total_swa_slots, head_dim]
-    topk_indices: torch.Tensor,  # [B, max_topk] int32/int64 slot indices
-    topk_lens: torch.Tensor,     # [B] actual topk count per request
-    swa_indices: torch.Tensor,   # [B, max_swa] int32/int64 slot indices
-    swa_lens: torch.Tensor,      # [B] actual SWA count per request
-    attn_sink: torch.Tensor,     # [128] float32 per-head sink bias
-    softmax_scale: float,
-    out: torch.Tensor,           # [B, num_heads=128, head_dim]
-) -> None:
-    """Dispatch sparse decode via CUTLASS paged flash attention."""
-    from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+class CutlassSparseDecodeState:
+    """Pre-allocated workspace for CUTLASS sparse decode.
 
-    B = q.shape[0]
-    head_dim = q.shape[-1]
-    num_heads = q.shape[1]
+    Instantiate once per attention layer. All buffers are sized for the
+    worst-case (max_model_len, max_batch_size) and reused every decode step.
+    """
 
-    # Compute GQA split: divide Q heads into groups of at most _MAX_GQA_RATIO
-    assert num_heads % _MAX_GQA_RATIO == 0 or num_heads <= _MAX_GQA_RATIO, (
-        f"num_heads={num_heads} must be <= {_MAX_GQA_RATIO} or divisible by it"
-    )
-    if num_heads <= _MAX_GQA_RATIO:
-        gqa_groups = 1
-        q_per_group = num_heads
-    else:
-        gqa_groups = num_heads // _MAX_GQA_RATIO
-        q_per_group = _MAX_GQA_RATIO
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        max_model_len: int,
+        max_batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        # GQA split params
+        assert num_heads % _MAX_GQA_RATIO == 0 or num_heads <= _MAX_GQA_RATIO
+        if num_heads <= _MAX_GQA_RATIO:
+            self.gqa_groups = 1
+            self.q_per_group = num_heads
+        else:
+            self.gqa_groups = num_heads // _MAX_GQA_RATIO
+            self.q_per_group = _MAX_GQA_RATIO
 
-    # Flatten KV caches to [total_slots, head_dim]
-    kv_flat = kv_cache.view(-1, head_dim)
-    swa_kv_flat = swa_kv_cache.view(-1, head_dim)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
 
-    # Total KV per request = topk + swa (upper bound for padding)
-    max_topk = topk_indices.shape[1]
-    max_swa = swa_indices.shape[1]
-    max_kv_total = max_topk + max_swa
+        # Max KV slots per request: use max_model_len as a safe upper bound
+        # (topk_indices can be up to index_topk=512, swa up to window_size,
+        # but we don't know index_topk here, so just use max_model_len).
+        max_kv_total = max_model_len
+        max_kv_padded = ((max_kv_total + _PAGE_SIZE - 1) // _PAGE_SIZE
+                         * _PAGE_SIZE)
+        self.max_blocks_per_seq = max_kv_padded // _PAGE_SIZE
+        self.max_kv_padded = max_kv_padded
 
-    # Pad to multiple of _PAGE_SIZE
-    max_kv_padded = ((max_kv_total + _PAGE_SIZE - 1) // _PAGE_SIZE
-                     * _PAGE_SIZE)
-    max_blocks_per_seq = max_kv_padded // _PAGE_SIZE
+        max_B = max_batch_size
+        total_blocks = max_B * self.max_blocks_per_seq
+        eff_batch = max_B * self.gqa_groups
 
-    # --- Fast gather: index_select all max slots, cat, pad ---
-    # Gather ALL max_topk slots from compressed cache and ALL max_swa from SWA.
-    # Invalid positions (beyond actual lens) gather garbage but are masked by
-    # seqused_k in the CUTLASS kernel, so correctness is preserved.
-    # Clamp indices to valid range to avoid OOB (padding slots may be -1 or 0).
-    topk_idx_clamped = topk_indices.long().clamp(0, kv_flat.shape[0] - 1)
-    swa_idx_clamped = swa_indices.long().clamp(0, swa_kv_flat.shape[0] - 1)
+        # Pre-allocate paged KV buffer (filled each call via index gather)
+        self._kv_buf = torch.zeros(
+            total_blocks, _PAGE_SIZE, 1, head_dim,
+            dtype=dtype, device=device,
+        )
 
-    topk_gathered = kv_flat[topk_idx_clamped.view(-1)].view(
-        B, max_topk, head_dim)
-    swa_gathered = swa_kv_flat[swa_idx_clamped.view(-1)].view(
-        B, max_swa, head_dim)
+        # cu_seqlens_q: [0, 1, 2, ..., eff_batch] — fixed for decode
+        self._cu_seqlens_q = torch.arange(
+            0, eff_batch + 1, dtype=torch.int32, device=device,
+        )
 
-    # Concatenate: [B, max_kv_total, head_dim]
-    combined = torch.cat([topk_gathered, swa_gathered], dim=1)
+        # Block table: sequential blocks, repeated for GQA groups
+        # Shape: [eff_batch, max_blocks_per_seq]
+        # For B requests: request i uses blocks [i*mpbs, (i+1)*mpbs)
+        seq_blocks = torch.arange(
+            total_blocks, dtype=torch.int32, device=device,
+        ).view(max_B, self.max_blocks_per_seq)
+        # Repeat each row gqa_groups times: [max_B*gqa, max_blocks_per_seq]
+        self._block_table_full = seq_blocks.repeat_interleave(
+            self.gqa_groups, dim=0
+        )
 
-    # Pad to max_kv_padded if needed
-    pad_len = max_kv_padded - max_kv_total
-    if pad_len > 0:
-        pad = torch.zeros(
-            B, pad_len, head_dim,
-            dtype=combined.dtype, device=combined.device)
-        combined = torch.cat([combined, pad], dim=1)
+        # seqused_k: [eff_batch] — filled each call
+        self._seqused_k = torch.zeros(
+            eff_batch, dtype=torch.int32, device=device,
+        )
 
-    # Reshape to paged format: [total_blocks, page_size, 1, head_dim]
-    total_blocks = B * max_blocks_per_seq
-    gathered_kv = combined.view(total_blocks, _PAGE_SIZE, 1, head_dim)
+        self._max_batch = max_B
+        self._device = device
 
-    # seqused_k: [B * gqa_groups] — actual KV length per effective sequence
-    all_lens = topk_lens + swa_lens  # [B]
-    seqused_k = all_lens.to(torch.int32).repeat_interleave(gqa_groups)
+    def __call__(
+        self,
+        q: torch.Tensor,         # [B, num_heads, head_dim]
+        kv_cache: torch.Tensor,  # [total_slots, head_dim] or [slots, 1, hd]
+        swa_kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,  # [B, max_topk]
+        topk_lens: torch.Tensor,     # [B]
+        swa_indices: torch.Tensor,   # [B, max_swa]
+        swa_lens: torch.Tensor,      # [B]
+        softmax_scale: float,
+        out: torch.Tensor,           # [B, num_heads, head_dim]
+    ) -> None:
+        from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 
-    # Block table: [B * gqa_groups, max_blocks_per_seq]
-    block_table = torch.arange(
-        total_blocks, dtype=torch.int32, device=q.device
-    ).view(B, max_blocks_per_seq).repeat_interleave(gqa_groups, dim=0)
+        B = q.shape[0]
+        head_dim = self.head_dim
+        gqa_groups = self.gqa_groups
+        eff_batch = B * gqa_groups
 
-    # Reshape Q: [B, 128, hd] -> [B*8, 16, hd]
-    q_grouped = q.view(B, gqa_groups, q_per_group, head_dim)
-    q_grouped = q_grouped.reshape(B * gqa_groups, q_per_group, head_dim)
-    q_grouped = q_grouped.contiguous()
+        # Flatten KV caches
+        kv_flat = kv_cache.view(-1, head_dim)
+        swa_kv_flat = swa_kv_cache.view(-1, head_dim)
 
-    # cu_seqlens_q: each effective sequence has 1 query token
-    effective_batch = B * gqa_groups
-    cu_seqlens_q = torch.arange(
-        0, effective_batch + 1, dtype=torch.int32, device=q.device
-    )
+        # Actual slot counts this call
+        max_topk = topk_indices.shape[1]
+        max_swa = swa_indices.shape[1]
 
-    # NOTE on attention sink: The CUTLASS kernel's sm_sink has shape
-    # [num_heads_kv, head_group_q] = [1, 16] — shared across all batch items.
-    # With GQA split, each group needs different sink values (heads 0-15 vs
-    # 16-31 etc). We skip sink for now (initialized to -inf = no effect in
-    # most heads). Accuracy impact is minimal for sparse decode.
-    # TODO: support per-group sink via 8 separate kernel calls if needed.
+        # Always use pre-allocated max layout. The kernel reads only up to
+        # seqused_k tokens, so extra blocks in the buffer are harmless.
+        blocks_per_seq = self.max_blocks_per_seq
+        total_blocks = B * blocks_per_seq
 
-    # Call CUTLASS paged decode
-    fa_out = flash_attn_varlen_func(
-        q=q_grouped,
-        k=gathered_kv,
-        v=gathered_kv,  # MLA: K and V share the same latent
-        max_seqlen_q=1,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_k=max_kv_padded,
-        seqused_k=seqused_k,
-        softmax_scale=softmax_scale,
-        causal=False,
-        block_table=block_table,
-        out=None,
-    )
+        # Clamp indices to valid range (padding slots may be -1)
+        topk_idx = topk_indices.long().clamp(0, kv_flat.shape[0] - 1)
+        swa_idx = swa_indices.long().clamp(0, swa_kv_flat.shape[0] - 1)
 
-    # fa_out: [B*8, 16, head_dim] -> [B, 128, head_dim]
-    out.copy_(fa_out.view(B, num_heads, head_dim))
+        # Gather into pre-allocated buffer with COMPACTED layout.
+        # The kernel reads positions [0, seqused_k) sequentially, so valid
+        # topk tokens must be followed immediately by valid SWA tokens with
+        # NO gap. We write per-request to place SWA at offset topk_lens[i].
+        kv_buf = self._kv_buf[:total_blocks].view(
+            B, blocks_per_seq * _PAGE_SIZE, head_dim)
+
+        for i in range(B):
+            n_topk = topk_lens[i].item()
+            n_swa = swa_lens[i].item()
+            # Valid topk at [0, n_topk)
+            kv_buf[i, :n_topk] = kv_flat[topk_idx[i, :n_topk]]
+            # Valid SWA immediately after at [n_topk, n_topk+n_swa)
+            kv_buf[i, n_topk:n_topk + n_swa] = (
+                swa_kv_flat[swa_idx[i, :n_swa]])
+
+        # Reshape back to paged format for kernel
+        gathered_kv = self._kv_buf[:total_blocks]
+
+        # Fill seqused_k: actual KV length per GQA-expanded sequence
+        all_lens = (topk_lens + swa_lens).to(torch.int32)
+        # Expand [B] -> [B*gqa_groups] without allocation
+        self._seqused_k[:eff_batch].view(B, gqa_groups)[:] = (
+            all_lens.unsqueeze(1).expand(B, gqa_groups))
+        seqused_k = self._seqused_k[:eff_batch]
+
+        # Block table: always use pre-allocated sequential layout
+        block_table = self._block_table_full[:eff_batch]
+
+        # Q reshape: [B, 128, hd] -> [B*gqa, 16, hd] (contiguous view)
+        q_grouped = q.view(B * gqa_groups, self.q_per_group, head_dim)
+
+        # cu_seqlens_q slice
+        cu_seqlens_q = self._cu_seqlens_q[:eff_batch + 1]
+
+        # Call CUTLASS paged decode
+        fa_out = flash_attn_varlen_func(
+            q=q_grouped,
+            k=gathered_kv,
+            v=gathered_kv,  # MLA: K and V share the same latent
+            max_seqlen_q=1,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=self.max_kv_padded,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+            block_table=block_table,
+            out=None,
+        )
+
+        # fa_out: [B*gqa, q_per_group, head_dim] -> [B, num_heads, head_dim]
+        out.copy_(fa_out.view(B, self.num_heads, head_dim))
