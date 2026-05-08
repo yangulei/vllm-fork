@@ -182,10 +182,10 @@ def indexer_logits_decode_fp8_paged(
     block_table = block_table.to(dtype=torch.int32, device=q_fp8.device).contiguous()
     k_scale = k_scale.to(dtype=torch.float32, device=q_fp8.device).contiguous()
 
-    max_seq_len = int(seq_flat.max().item()) if seq_flat.numel() > 0 else 0
-    assert max_seq_len <= max_model_len, (
-        f"max seq len {max_seq_len} exceeds max_model_len {max_model_len}"
-    )
+    # Use block_table shape as upper bound for max_seq_len to avoid
+    # .item() which forces a CPU-GPU sync on every call.
+    block_size = k_cache.shape[1]
+    max_seq_len = block_table.shape[1] * block_size
 
     if t_tokens == 0:
         return torch.empty((0, max_seq_len), device=q_fp8.device, dtype=torch.float32)
@@ -209,7 +209,6 @@ def indexer_logits_decode_fp8_paged(
         num_stages=2,
     )
 
-    block_size = k_cache.shape[1]
     grid = (t_tokens, num_heads)
     _indexer_logits_decode_fp8_paged_kernel[grid](
         q_flat,
