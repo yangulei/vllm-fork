@@ -221,11 +221,11 @@ def mhc_pre(
     """
 
     if current_platform.is_xpu():
-        from vllm.v1.attention.ops.deepseek_v4_ops.mhc_xpu import (
-            mhc_pre_xpu_torch,
+        from vllm.v1.attention.ops.deepseek_v4_ops.mhc_xpu_triton import (
+            mhc_pre_xpu_triton,
         )
 
-        return mhc_pre_xpu_torch(
+        return mhc_pre_xpu_triton(
             residual,
             fn,
             hc_scale,
@@ -492,11 +492,11 @@ def mhc_post(
         return (mixed_residual + post_term).to(residual.dtype)
 
     if current_platform.is_xpu():
-        from vllm.v1.attention.ops.deepseek_v4_ops.mhc_xpu import (
-            mhc_post_xpu_torch,
+        from vllm.v1.attention.ops.deepseek_v4_ops.mhc_xpu_triton import (
+            mhc_post_xpu_triton,
         )
 
-        return mhc_post_xpu_torch(x, residual, post_layer_mix, comb_res_mix)
+        return mhc_post_xpu_triton(x, residual, post_layer_mix, comb_res_mix)
 
     out = torch.empty_like(residual)
     mhc_post_tilelang(
