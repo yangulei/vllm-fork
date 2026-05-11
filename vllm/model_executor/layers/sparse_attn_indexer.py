@@ -238,18 +238,18 @@ def sparse_attn_indexer(
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
             if current_platform.is_xpu() and not use_fp4_cache:
-                logger.info_once("XPU: indexer logits prefill kernel dispatched")
-                from vllm.v1.attention.ops.deepseek_v4_ops.indexer_logits_prefill_fp8 import (
-                    indexer_logits_prefill_fp8,
-                )
+                logger.info_once("XPU: indexer logits prefill kernel "
+                                 "dispatched (SYCL fp8_mqa_logits)")
+                import vllm_xpu_kernels._xpu_C  # noqa: F401
 
-                logits = indexer_logits_prefill_fp8(
+                logits = torch.ops._xpu_C.fp8_mqa_logits(
                     q_slice_cast,
                     k_quant_cast,
-                    k_scale_cast,
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    k_scale_cast.contiguous(),
+                    weights[chunk.token_start : chunk.token_end]
+                    .float().contiguous(),
+                    chunk.cu_seqlen_ks.to(torch.int32).contiguous(),
+                    chunk.cu_seqlen_ke.to(torch.int32).contiguous(),
                 )
             else:
                 logits = fp8_fp4_mqa_logits(
@@ -342,24 +342,27 @@ def sparse_attn_indexer(
             else padded_q_quant_decode_tokens
         )
         if current_platform.is_xpu() and not use_fp4_cache:
-            logger.info_once("XPU: indexer logits decode kernel dispatched")
-            from vllm.v1.attention.ops.deepseek_v4_ops.indexer_logits_decode_fp8_paged import (
-                indexer_logits_decode_fp8_paged,
-            )
+            logger.info_once("XPU: indexer logits decode kernel dispatched "
+                             "(SYCL fp8_paged_mqa_logits)")
+            import vllm_xpu_kernels._xpu_C  # noqa: F401
 
             q_decode = padded_q_quant_decode_tokens
             if q_decode.ndim == 3:
-                q_decode = q_decode.reshape(batch_size, next_n, *q_decode.shape[1:])
-            k_fp8 = raw_kv_cache[:, :, :head_dim].view(torch.float8_e4m3fn)
-            k_scale = raw_kv_cache[:, :, head_dim:].view(torch.float32).squeeze(-1)
-            logits = indexer_logits_decode_fp8_paged(
+                q_decode = q_decode.reshape(batch_size, next_n,
+                                            *q_decode.shape[1:])
+            # SYCL kernel expects packed KV cache [blocks, bs, 1, D+4]
+            kv_cache_packed = raw_kv_cache.unsqueeze(-2)
+            # context_lens: 1D [B] — take the max per-batch seq_len
+            # (last spec token sees the most KV entries)
+            context_lens = seq_lens[:, -1].to(torch.int32).contiguous()
+            logits = torch.ops._xpu_C.fp8_paged_mqa_logits(
                 q_decode,
-                k_fp8,
-                k_scale,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                max_model_len=max_model_len,
+                kv_cache_packed,
+                weights[:num_padded_tokens].float().contiguous(),
+                context_lens,
+                decode_metadata.block_table.to(torch.int32).contiguous(),
+                decode_metadata.schedule_metadata,
+                max_model_len,
             )
         else:
             logits = fp8_fp4_paged_mqa_logits(
