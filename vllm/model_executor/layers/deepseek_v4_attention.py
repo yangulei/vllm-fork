@@ -720,7 +720,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.prefix = prefix  # Alias for compatibility with compressor
 
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.ln_events = [current_platform.Event(), current_platform.Event()]
 
         # Determine padded head count for FlashMLA
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
