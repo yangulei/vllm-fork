@@ -1431,6 +1431,8 @@ class DeepseekV4Model(nn.Module):
 
                 if is_pp_missing_parameter(name, self):
                     break
+                if name not in params_dict:
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1453,6 +1455,8 @@ class DeepseekV4Model(nn.Module):
                             continue
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
+                            continue
+                        if name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
@@ -1477,6 +1481,8 @@ class DeepseekV4Model(nn.Module):
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    if name not in params_dict:
+                        continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
                     params_dict[name][:n].copy_(narrow_weight)
@@ -1484,6 +1490,8 @@ class DeepseekV4Model(nn.Module):
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
