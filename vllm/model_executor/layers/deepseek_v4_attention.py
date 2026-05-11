@@ -720,6 +720,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.prefix = prefix  # Alias for compatibility with compressor
 
         self.aux_stream = aux_stream
+        from vllm.platforms import current_platform
         self.ln_events = [current_platform.Event(), current_platform.Event()]
 
         # Determine padded head count for FlashMLA
