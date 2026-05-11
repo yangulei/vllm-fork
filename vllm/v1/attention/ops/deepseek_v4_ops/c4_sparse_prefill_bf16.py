@@ -165,6 +165,7 @@ def c4_sparse_prefill_bf16(
 
     T, H, D = q.shape
     k_max = topk_indices.shape[1]
+
     grid = (T, H)
     _c4_sparse_prefill_bf16_kernel[grid](
         q,
@@ -182,7 +183,7 @@ def c4_sparse_prefill_bf16(
         K_MAX=k_max,
         D=D,
         BLOCK_K=BLOCK_K,
-        num_warps=4,
+        num_warps=16,
     )
 
 
