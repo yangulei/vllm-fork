@@ -534,14 +534,7 @@ direct_register_custom_op(
 )
 
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-    },
-)
-def hc_head_fuse_tilelang(
+def _hc_head_fuse_tilelang_impl(
     residual,
     fn,
     hc_scale,
@@ -576,11 +569,6 @@ def hc_head_fuse_tilelang(
     with T.Kernel(num_tokens, threads=n_thr) as i:
         T.pdl_sync()
 
-        # ------------------------------------------------------------------
-        # Pass 1 – for each residual channel m_c and h_block:
-        #   • accumulate squared sum (for RMS norm denominator)
-        #   • accumulate hc_mult dot-products with fn rows
-        # ------------------------------------------------------------------
         sqrsum_r = T.alloc_reducer((1,), T.float32, replication="all")
         mixes_r = T.alloc_reducer((hc_mult,), T.float32, replication="all")
         T.fill(sqrsum_r, 0.0)
@@ -603,9 +591,6 @@ def hc_head_fuse_tilelang(
         T.finalize_reducer(sqrsum_r)
         T.finalize_reducer(mixes_r)
 
-        # ------------------------------------------------------------------
-        # Compute pre_mix = sigmoid(mix * rsqrt * scale + base) + eps
-        # ------------------------------------------------------------------
         pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
         rsqrt_val = T.alloc_fragment(1, T.float32)
         rsqrt_val[0] = T.rsqrt(sqrsum_r[0] / hc_dim + rms_eps)
@@ -614,9 +599,6 @@ def hc_head_fuse_tilelang(
                 T.sigmoid(mixes_r[m] * rsqrt_val[0] * hc_scale[0] + hc_base[m]) + hc_eps
             )
 
-        # ------------------------------------------------------------------
-        # Pass 2 – apply_mix: pipelined weighted sum over residual channels
-        # ------------------------------------------------------------------
         for i0_h in T.Pipelined(n_h, num_stages=2):
             xs = T.alloc_shared((hc_mult, h_block), T.bfloat16)
             xl = T.alloc_fragment((hc_mult, h_block), T.float32)
@@ -633,6 +615,18 @@ def hc_head_fuse_tilelang(
             T.copy(ol, out[i, i0_h * h_block], disable_tma=True)
 
         T.pdl_trigger()
+
+
+if tilelang is None:
+    hc_head_fuse_tilelang = _mhc_pre_big_fuse_tilelang_unavailable
+else:
+    hc_head_fuse_tilelang = tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        },
+    )(_hc_head_fuse_tilelang_impl)
 
 
 def _hc_head_fused_reference(
@@ -692,12 +686,8 @@ def _hc_head_fused_kernel(
     """Fill pre-allocated `out` (T, H) in-place with the hc_head result."""
     if hs_flat.shape[0] == 0:
         return
-    if current_platform.is_rocm():
-        # tilelang ships only the CUDA codegen in upstream wheels, so the HIP
-        # FFI target (`target.build.tilelang_hip`) is missing and the JIT call
-        # would raise `ValueError: Cannot find global function ...`. Use a
-        # numerically equivalent torch fallback instead. `mhc_pre` and
-        # `mhc_post` already follow this same pattern above.
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        # tilelang is CUDA-only. Use numerically equivalent torch fallback.
         _hc_head_fused_reference(
             hs_flat,
             fn,
