@@ -635,18 +635,13 @@ class xpu_ops:
         strdide1: int,
         topk_tokens: int,
     ) -> torch.Tensor:
-        real_topk = min(topk_tokens, logits.shape[-1])
-        topk_indices = logits.topk(real_topk, dim=-1)[1].to(torch.int32)
-        topk_indices -= cu_seqlen_ks[:, None]
-        mask_lo = topk_indices >= 0
-        mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:, None] < 0
-        mask = torch.full_like(
-            topk_indices, False, dtype=torch.bool, device=topk_indices.device
-        )
-        mask = mask_lo & mask_hi
-        topk_indices.masked_fill_(~mask, -1)
-        raw_topk_indices[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
-            topk_indices
+        # logits from fp8_mqa_logits is already float32
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            cu_seqlen_ks.to(torch.int32),
+            cu_seqlen_ke.to(torch.int32),
+            raw_topk_indices,
+            num_rows, logits.stride(0), logits.stride(1), topk_tokens,
         )
         return raw_topk_indices
 
@@ -661,39 +656,15 @@ class xpu_ops:
         stride1: int,
         topk_tokens: int,
     ) -> torch.Tensor:
-        device = logits.device
-        batch_size = seq_lens.size(0)
-        # padded query len
-        padded_num_tokens = batch_size * next_n
         if logits.shape[-1] == 0 or topk_tokens == 0:
             return raw_topk_indices
-
-        if seq_lens.ndim == 2:
-            assert seq_lens.shape == (batch_size, next_n)
-            index_end_pos = seq_lens.reshape(-1).unsqueeze(1) - 1
-        else:
-            assert seq_lens.ndim == 1
-            row_indices = torch.arange(padded_num_tokens, device=device) // next_n
-            next_n_offset = torch.arange(padded_num_tokens, device=device) % next_n
-            index_end_pos = (seq_lens[row_indices] - next_n + next_n_offset).unsqueeze(1)
-
-        positions = (
-            torch.arange(logits.shape[-1], device=device)
-            .unsqueeze(0)
-            .expand(batch_size * next_n, -1)
-        )
-        # index_end_pos: [B * N, 1]
-        mask = positions <= index_end_pos
-        # mask: [B * N, L]
-        logits = logits.masked_fill(~mask, float("-inf"))
-        real_topk = min(topk_tokens, logits.shape[-1])
-        topk_indices = logits.topk(real_topk, dim=-1)[1].to(torch.int32)  # [B * N, K]
-        # ensure we don't set indices for the top k
-        # that is out of range(masked already)
-        # this will happen if context length is shorter than K
-        topk_indices[topk_indices > index_end_pos] = -1
-        raw_topk_indices[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
-            topk_indices
+        # SYCL kernel expects 1-D seqLens (B,); CUDA supports 2-D (B, next_n)
+        # but SYCL does not — flatten to 1-D for now.
+        sl = seq_lens.contiguous().view(-1) if seq_lens.ndim == 2 and seq_lens.shape[1] == 1 else seq_lens
+        torch.ops._C.top_k_per_row_decode(
+            logits, next_n, sl.to(torch.int32),
+            raw_topk_indices,
+            num_rows, logits.stride(0), logits.stride(1), topk_tokens,
         )
         return raw_topk_indices
 
