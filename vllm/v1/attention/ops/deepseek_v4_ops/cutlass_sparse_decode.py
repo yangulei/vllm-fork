@@ -1,34 +1,146 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-CUTLASS paged decode for DeepSeek V4 sparse attention on XPU.
+Triton sparse decode for DeepSeek V4 on XPU.
 
 Strategy:
-  1. Gather topk + SWA KV slots into a pre-allocated paged buffer.
-  2. Split Q heads into GQA groups of 16 (kernel's max ratio).
-  3. Call flash_attn_varlen_func with pre-built block_table + seqused_k.
+  1. Fused Triton kernel gathers topk + SWA KV slots from two separate
+     caches into a compacted flat workspace — single kernel launch,
+     no intermediate index tensors.
+  2. Call c4_sparse_prefill_bf16 (per-head Triton kernel optimized for
+     D=512 MQA with num_warps=16).
 
-Performance: all metadata tensors (cu_seqlens_q, block_table) are pre-allocated
-once and reused across decode steps. Only the KV gather (index into cache) and
-seqused_k fill happen per call — zero torch.cat/zeros/arange allocations.
+This replaces the previous CUTLASS paged decode which used a Python
+for-loop gather + flash_attn_varlen_func.
 """
 
 import torch
+import triton
+import triton.language as tl
 
 
-# Block size for the temporary paged KV buffer.
-# 16 is the smallest supported by the CUTLASS paged decode kernel.
-_PAGE_SIZE = 16
+@triton.jit
+def _fused_dual_gather_kernel(
+    # Output workspace: [B * K_total, D]  (row-major)
+    ws_ptr,
+    # Source caches (flat): [N_topk, D] and [N_swa, D]
+    kv_ptr,
+    swa_kv_ptr,
+    # Index tensors: [B, max_topk] and [B, max_swa]
+    topk_idx_ptr,
+    swa_idx_ptr,
+    # Length tensors: [B]
+    topk_lens_ptr,
+    swa_lens_ptr,
+    # Strides
+    topk_idx_stride_b: tl.constexpr,  # stride of topk_idx along batch dim
+    swa_idx_stride_b: tl.constexpr,   # stride of swa_idx along batch dim
+    # Constants
+    K_total: tl.constexpr,
+    max_topk: tl.constexpr,
+    max_swa: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    N_kv: tl.int64,   # kv_flat total rows (for clamping)
+    N_swa: tl.int64,  # swa_kv_flat total rows (for clamping)
+):
+    """Fused gather kernel: for each (batch, slot) position, read from
+    topk cache or SWA cache based on per-request lengths, and write
+    compacted into the workspace.
 
-# Max GQA ratio supported by the CUTLASS kernel
-_MAX_GQA_RATIO = 16
+    Grid: (B, K_total) — one program per (batch, slot) pair.
+    Each program copies D elements.
+    """
+    bid = tl.program_id(0)  # batch index
+    sid = tl.program_id(1)  # slot index within K_total
+
+    nt = tl.load(topk_lens_ptr + bid).to(tl.int32)
+    ns = tl.load(swa_lens_ptr + bid).to(tl.int32)
+
+    # Output row in workspace
+    ws_row = bid * K_total + sid
+    d_offs = tl.arange(0, BLOCK_D)
+    ws_base = ws_ptr + ws_row * D
+
+    if sid < nt:
+        # Topk region: read from kv_flat
+        src_idx = tl.load(topk_idx_ptr + bid * topk_idx_stride_b + sid).to(
+            tl.int64)
+        # Clamp to valid range
+        src_idx = tl.where(src_idx < 0, tl.zeros_like(src_idx), src_idx)
+        src_idx = tl.where(src_idx >= N_kv, N_kv - 1, src_idx)
+        src_base = kv_ptr + src_idx * D
+        for d_start in tl.static_range(0, D, BLOCK_D):
+            d_idx = d_start + d_offs
+            mask = d_idx < D
+            vals = tl.load(src_base + d_idx, mask=mask)
+            tl.store(ws_base + d_idx, vals, mask=mask)
+    elif sid < nt + ns:
+        # SWA region: read from swa_kv_flat
+        swa_pos = sid - nt
+        src_idx = tl.load(
+            swa_idx_ptr + bid * swa_idx_stride_b + swa_pos).to(tl.int64)
+        src_idx = tl.where(src_idx < 0, tl.zeros_like(src_idx), src_idx)
+        src_idx = tl.where(src_idx >= N_swa, N_swa - 1, src_idx)
+        src_base = swa_kv_ptr + src_idx * D
+        for d_start in tl.static_range(0, D, BLOCK_D):
+            d_idx = d_start + d_offs
+            mask = d_idx < D
+            vals = tl.load(src_base + d_idx, mask=mask)
+            tl.store(ws_base + d_idx, vals, mask=mask)
+    else:
+        # Padding region: write zeros
+        zero = tl.zeros([BLOCK_D], dtype=tl.bfloat16)
+        for d_start in tl.static_range(0, D, BLOCK_D):
+            d_idx = d_start + d_offs
+            mask = d_idx < D
+            tl.store(ws_base + d_idx, zero, mask=mask)
+
+
+def fused_dual_gather(
+    ws: torch.Tensor,           # [B, K_total, D] output
+    topk_idx: torch.Tensor,     # [B, max_topk] int64, clamped
+    swa_idx: torch.Tensor,      # [B, max_swa] int64, clamped
+    topk_lens: torch.Tensor,    # [B] int32
+    swa_lens: torch.Tensor,     # [B] int32
+    max_topk: int,
+    max_swa: int,
+    kv_flat: torch.Tensor,      # [N_topk, D] bf16
+    swa_kv_flat: torch.Tensor,  # [N_swa, D] bf16
+) -> None:
+    B, K_total, D = ws.shape
+    assert K_total == max_topk + max_swa
+
+    # Choose BLOCK_D: must be power of 2, >= D
+    BLOCK_D = triton.next_power_of_2(D)
+
+    grid = (B, K_total)
+    _fused_dual_gather_kernel[grid](
+        ws.view(-1, D),
+        kv_flat,
+        swa_kv_flat,
+        topk_idx,
+        swa_idx,
+        topk_lens,
+        swa_lens,
+        topk_idx.stride(0),
+        swa_idx.stride(0),
+        K_total=K_total,
+        max_topk=max_topk,
+        max_swa=max_swa,
+        D=D,
+        BLOCK_D=BLOCK_D,
+        N_kv=kv_flat.shape[0],
+        N_swa=swa_kv_flat.shape[0],
+    )
 
 
 class CutlassSparseDecodeState:
-    """Pre-allocated workspace for CUTLASS sparse decode.
+    """Pre-allocated workspace for Triton sparse decode.
 
     Instantiate once per attention layer. All buffers are sized for the
-    worst-case (max_model_len, max_batch_size) and reused every decode step.
+    worst-case and reused every decode step — zero per-call allocations
+    on the hot path.
     """
 
     def __init__(
@@ -40,60 +152,47 @@ class CutlassSparseDecodeState:
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        # GQA split params
-        assert num_heads % _MAX_GQA_RATIO == 0 or num_heads <= _MAX_GQA_RATIO
-        if num_heads <= _MAX_GQA_RATIO:
-            self.gqa_groups = 1
-            self.q_per_group = num_heads
-        else:
-            self.gqa_groups = num_heads // _MAX_GQA_RATIO
-            self.q_per_group = _MAX_GQA_RATIO
-
         self.num_heads = num_heads
         self.head_dim = head_dim
-
-        # Max KV slots per request: use max_model_len as a safe upper bound
-        # (topk_indices can be up to index_topk=512, swa up to window_size,
-        # but we don't know index_topk here, so just use max_model_len).
-        max_kv_total = max_model_len
-        max_kv_padded = ((max_kv_total + _PAGE_SIZE - 1) // _PAGE_SIZE
-                         * _PAGE_SIZE)
-        self.max_blocks_per_seq = max_kv_padded // _PAGE_SIZE
-        self.max_kv_padded = max_kv_padded
-
-        max_B = max_batch_size
-        total_blocks = max_B * self.max_blocks_per_seq
-        eff_batch = max_B * self.gqa_groups
-
-        # Pre-allocate paged KV buffer (filled each call via index gather)
-        self._kv_buf = torch.zeros(
-            total_blocks, _PAGE_SIZE, 1, head_dim,
-            dtype=dtype, device=device,
-        )
-
-        # cu_seqlens_q: [0, 1, 2, ..., eff_batch] — fixed for decode
-        self._cu_seqlens_q = torch.arange(
-            0, eff_batch + 1, dtype=torch.int32, device=device,
-        )
-
-        # Block table: sequential blocks, repeated for GQA groups
-        # Shape: [eff_batch, max_blocks_per_seq]
-        # For B requests: request i uses blocks [i*mpbs, (i+1)*mpbs)
-        seq_blocks = torch.arange(
-            total_blocks, dtype=torch.int32, device=device,
-        ).view(max_B, self.max_blocks_per_seq)
-        # Repeat each row gqa_groups times: [max_B*gqa, max_blocks_per_seq]
-        self._block_table_full = seq_blocks.repeat_interleave(
-            self.gqa_groups, dim=0
-        )
-
-        # seqused_k: [eff_batch] — filled each call
-        self._seqused_k = torch.zeros(
-            eff_batch, dtype=torch.int32, device=device,
-        )
-
-        self._max_batch = max_B
+        self._max_batch = max_batch_size
         self._device = device
+        self._dtype = dtype
+
+        # Lazily initialized on first call when we know max_topk + max_swa.
+        self._K_total: int = 0
+        self._kv_workspace: torch.Tensor | None = None
+        self._ws_indices: torch.Tensor | None = None
+
+    def _ensure_buffers(self, B: int, max_topk: int, max_swa: int) -> None:
+        """Allocate/resize workspace buffers when shapes change."""
+        K_total = max_topk + max_swa
+        need_init = (
+            self._kv_workspace is None
+            or K_total != self._K_total
+            or B > self._kv_workspace.shape[0] // max(self._K_total, 1)
+        )
+        if not need_init:
+            return
+
+        self._K_total = K_total
+        max_B = max(B, self._max_batch)
+
+        # Flat workspace: [max_B * K_total, head_dim]
+        self._kv_workspace = torch.zeros(
+            max_B * K_total, self.head_dim,
+            dtype=self._dtype, device=self._device,
+        )
+
+        # Sequential indices: [max_B, K_total]
+        # Row i = [i*K_total, i*K_total+1, ..., i*K_total+K_total-1]
+        base = torch.arange(
+            0, max_B * K_total, K_total,
+            dtype=torch.int32, device=self._device,
+        )
+        offsets = torch.arange(
+            K_total, dtype=torch.int32, device=self._device,
+        )
+        self._ws_indices = base.unsqueeze(1) + offsets.unsqueeze(0)
 
     def __call__(
         self,
@@ -107,79 +206,45 @@ class CutlassSparseDecodeState:
         softmax_scale: float,
         out: torch.Tensor,           # [B, num_heads, head_dim]
     ) -> None:
-        from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+        from vllm.v1.attention.ops.deepseek_v4_ops.c4_sparse_prefill_bf16 import (  # noqa: E501
+            c4_sparse_prefill_bf16,
+        )
 
         B = q.shape[0]
         head_dim = self.head_dim
-        gqa_groups = self.gqa_groups
-        eff_batch = B * gqa_groups
-
-        # Flatten KV caches
-        kv_flat = kv_cache.view(-1, head_dim)
-        swa_kv_flat = swa_kv_cache.view(-1, head_dim)
-
-        # Actual slot counts this call
         max_topk = topk_indices.shape[1]
         max_swa = swa_indices.shape[1]
+        K_total = max_topk + max_swa
 
-        # Always use pre-allocated max layout. The kernel reads only up to
-        # seqused_k tokens, so extra blocks in the buffer are harmless.
-        blocks_per_seq = self.max_blocks_per_seq
-        total_blocks = B * blocks_per_seq
+        self._ensure_buffers(B, max_topk, max_swa)
+
+        # Flatten KV caches to [total_slots, head_dim]
+        kv_flat = kv_cache.view(-1, head_dim)
+        swa_kv_flat = swa_kv_cache.view(-1, head_dim)
 
         # Clamp indices to valid range (padding slots may be -1)
         topk_idx = topk_indices.long().clamp(0, kv_flat.shape[0] - 1)
         swa_idx = swa_indices.long().clamp(0, swa_kv_flat.shape[0] - 1)
 
-        # Gather into pre-allocated buffer with COMPACTED layout.
-        # The kernel reads positions [0, seqused_k) sequentially, so valid
-        # topk tokens must be followed immediately by valid SWA tokens with
-        # NO gap. We write per-request to place SWA at offset topk_lens[i].
-        kv_buf = self._kv_buf[:total_blocks].view(
-            B, blocks_per_seq * _PAGE_SIZE, head_dim)
-
-        for i in range(B):
-            n_topk = topk_lens[i].item()
-            n_swa = swa_lens[i].item()
-            # Valid topk at [0, n_topk)
-            kv_buf[i, :n_topk] = kv_flat[topk_idx[i, :n_topk]]
-            # Valid SWA immediately after at [n_topk, n_topk+n_swa)
-            kv_buf[i, n_topk:n_topk + n_swa] = (
-                swa_kv_flat[swa_idx[i, :n_swa]])
-
-        # Reshape back to paged format for kernel
-        gathered_kv = self._kv_buf[:total_blocks]
-
-        # Fill seqused_k: actual KV length per GQA-expanded sequence
-        all_lens = (topk_lens + swa_lens).to(torch.int32)
-        # Expand [B] -> [B*gqa_groups] without allocation
-        self._seqused_k[:eff_batch].view(B, gqa_groups)[:] = (
-            all_lens.unsqueeze(1).expand(B, gqa_groups))
-        seqused_k = self._seqused_k[:eff_batch]
-
-        # Block table: always use pre-allocated sequential layout
-        block_table = self._block_table_full[:eff_batch]
-
-        # Q reshape: [B, 128, hd] -> [B*gqa, 16, hd] (contiguous view)
-        q_grouped = q.view(B * gqa_groups, self.q_per_group, head_dim)
-
-        # cu_seqlens_q slice
-        cu_seqlens_q = self._cu_seqlens_q[:eff_batch + 1]
-
-        # Call CUTLASS paged decode
-        fa_out = flash_attn_varlen_func(
-            q=q_grouped,
-            k=gathered_kv,
-            v=gathered_kv,  # MLA: K and V share the same latent
-            max_seqlen_q=1,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_k=self.max_kv_padded,
-            seqused_k=seqused_k,
-            softmax_scale=softmax_scale,
-            causal=False,
-            block_table=block_table,
-            out=None,
+        # Fused Triton gather: build compacted layout and gather KV data
+        # from two source caches in a single kernel launch.
+        ws = self._kv_workspace[:B * K_total].view(B, K_total, head_dim)
+        fused_dual_gather(
+            ws, topk_idx, swa_idx,
+            topk_lens.to(torch.int32), swa_lens.to(torch.int32),
+            max_topk, max_swa,
+            kv_flat, swa_kv_flat,
         )
 
-        # fa_out: [B*gqa, q_per_group, head_dim] -> [B, num_heads, head_dim]
-        out.copy_(fa_out.view(B, self.num_heads, head_dim))
+        # Combined lens: topk_lens + swa_lens
+        combined_lens = (topk_lens + swa_lens).to(torch.int32)
+
+        # Call Triton sparse prefill kernel (optimized for D=512 MQA)
+        c4_sparse_prefill_bf16(
+            q=q,
+            kv_workspace=ws.view(-1, head_dim),
+            topk_indices=self._ws_indices[:B, :K_total],
+            topk_lens=combined_lens,
+            softmax_scale=softmax_scale,
+            out=out,
+        )

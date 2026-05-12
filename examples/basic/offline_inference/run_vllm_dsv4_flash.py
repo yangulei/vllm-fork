@@ -202,6 +202,10 @@ def main() -> None:
 
         if PROFILE:
             print(f"Profiling enabled, output dir: {PROFILE_DIR}")
+            # Warmup run: triggers all Triton JIT compilations before profiling
+            print("  warmup run (no profiling)...")
+            llm.chat(messages_list, sampling_params=sampling)
+            print("  warmup done, starting profiled run...")
             llm.start_profile()
             outputs = llm.chat(messages_list, sampling_params=sampling)
             llm.stop_profile()
