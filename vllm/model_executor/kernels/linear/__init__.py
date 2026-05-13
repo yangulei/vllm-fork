@@ -139,6 +139,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     TritonFp8BlockScaledMMKernel,
     TritonInt8ScaledMMLinearKernel,
+    XPUOneDNNFp8BlockScaledMMKernel,
     XPUTritonFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
@@ -205,6 +206,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         CPUFp8BlockScaledMMKernel,
     ],
     PlatformEnum.XPU: [
+        XPUOneDNNFp8BlockScaledMMKernel,
         XPUTritonFp8BlockScaledMMKernel,
     ],
 }

@@ -180,12 +180,117 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         )
 
 
-class XPUTritonFp8BlockScaledMMKernel(TritonFp8BlockScaledMMKernel):
-    """XPU variant: same Triton implementation, gated by XPU platform check.
+class XPUOneDNNFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    """XPU variant using oneDNN fp8_gemm for block-scaled FP8 GEMM.
 
-    The underlying w8a8_triton_block_scaled_mm kernel is pure Triton and runs
-    on Intel XPU via triton-xpu. is_supported() override is the only XPU-specific
-    change; kernel body is shared with the CUDA path.
+    oneDNN's fp8_gemm is dramatically faster than Triton for decode (M=1):
+    ~20-45x speedup due to optimized GEMV paths that saturate HBM bandwidth,
+    vs Triton's BLOCK_M=64 which wastes 63/64 threads for M=1.
+
+    Uses the same oneDNN backend on both PVC (Max 1550) and BMG (Arc),
+    so optimizations are portable across Intel XPU generations.
+    """
+
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        if not current_platform.is_xpu():
+            return False, "only XPU devices are supported by this variant."
+        try:
+            import vllm_xpu_kernels._xpu_C  # noqa: F401
+            return True, None
+        except ImportError:
+            return False, "vllm_xpu_kernels not available."
+
+    @classmethod
+    def can_implement(cls, config):
+        can, reason = super().can_implement(config)
+        if not can:
+            return can, reason
+        # oneDNN requires N and K divisible by block_size (128).
+        # e.g. kv_a_proj N=576 is not divisible → fall through to Triton.
+        N, K = config.weight_shape
+        block_size = 128
+        if N % block_size != 0 or K % block_size != 0:
+            return (
+                False,
+                f"oneDNN fp8_gemm requires N({N}) and K({K}) "
+                f"divisible by {block_size}.",
+            )
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # Use base class weight processing only (no transpose).
+        # We do NOT pre-transpose the weight here because other code paths
+        # (e.g. DSv4 wo_a dequant) access layer.weight directly and expect
+        # the original (N, K) layout. The transpose to (K, N) for oneDNN
+        # is done at runtime in apply_block_scaled_mm via B.t().
+        super().process_weights_after_loading(layer)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        out_dtype = self.config.out_dtype
+        params = self._get_layer_params(layer)
+        weight = params.weight
+        weight_scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
+        input_scale = params.input_scale
+        scale_up = params.input_scale_ub
+
+        input_2d = x.view(-1, x.shape[-1])
+        # Weight is (N, K) — standard layout, use shape[0] for output dim
+        output_shape = [*x.shape[:-1], weight.shape[0]]
+
+        if self.apply_input_quant:
+            q_input, input_scale = self.quant_fp8(
+                input_2d, input_scale, scale_up, use_triton=self.use_triton
+            )
+        else:
+            q_input = input_2d
+            input_scale = (
+                input_scale if input_scale is not None else input_2d.new_ones(1)
+            )
+
+        output = self.apply_block_scaled_mm(
+            A=q_input,
+            B=weight,
+            As=input_scale,
+            Bs=weight_scale,
+        )
+
+        if bias is not None:
+            output = output + bias
+        return output.to(dtype=out_dtype).view(*output_shape)
+
+    def apply_block_scaled_mm(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+    ) -> torch.Tensor:
+        if Bs.dtype == torch.float8_e8m0fnu:
+            Bs = torch.exp2(Bs.view(torch.uint8).to(torch.float32) - 127.0)
+        # B is (N, K); oneDNN expects (K, N). Use .t() (non-contiguous view)
+        # — oneDNN auto-detects nt format from strides, no copy needed.
+        return torch.ops._xpu_C.fp8_gemm(
+            A, B.t(), self.config.out_dtype, As, Bs, torch.Tensor()
+        )
+
+
+class XPUTritonFp8BlockScaledMMKernel(TritonFp8BlockScaledMMKernel):
+    """XPU Triton fallback for block-scaled FP8 GEMM.
+
+    Used when oneDNN path is not available (e.g., vllm_xpu_kernels not
+    installed). The underlying w8a8_triton_block_scaled_mm kernel is pure
+    Triton and runs on Intel XPU via triton-xpu.
     """
 
     @classmethod
