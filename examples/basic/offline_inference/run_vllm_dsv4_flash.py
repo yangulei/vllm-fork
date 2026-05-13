@@ -20,6 +20,7 @@ Usage:
   python run_vllm_dsv4_flash.py                 # 4-layer harness, [0,0,4,128]
   FULL=1 python run_vllm_dsv4_flash.py          # full 43-layer model
   FULL=1 TP=8 python run_vllm_dsv4_flash.py     # full model with explicit TP
+  FULL=1 TP=8 USE_EP=1 python run_vllm_dsv4_flash.py  # full model with expert parallel
   N_LAYERS=43 python run_vllm_dsv4_flash.py     # same as FULL=1
   N_LAYERS=8 python run_vllm_dsv4_flash.py      # custom truncation
   COMPRESS_RATIOS='[0,0,4,128]' N_LAYERS=4 python run_vllm_dsv4_flash.py
@@ -135,11 +136,18 @@ GPU_MEM_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.85"))
 tp_env = os.environ.get("TP")
 TP_SIZE = int(tp_env) if tp_env is not None else (8 if FULL else 1)
 
+# Expert parallelism: EP=1 enables MoE EP (experts sharded across TP ranks).
+# Each GPU owns n_routed_experts/tp_size experts; non-MoE layers still use TP.
+# Uses allgather_reducescatter all2all backend (oneCCL).
+ENABLE_EP = os.environ.get("USE_EP", "0") == "1"
+
 print("=== DeepSeek-V4-Flash XPU launch (offline) ===")
 print(f"Model:         {MODEL}")
 print(f"mode:          {'FULL (43 layers)' if FULL else f'truncated harness ({N_LAYERS} layers)'}")
 print(f"hf-overrides:  {json.dumps(HF_OVERRIDES)}")
 print(f"max_model_len: {MAX_MODEL_LEN}, tp_size: {TP_SIZE}, gpu_mem_util: {GPU_MEM_UTIL}")
+if ENABLE_EP:
+    print(f"expert_parallel: ENABLED (ep_size={TP_SIZE})")
 print(f"prompt:        {PROMPT!r}")
 print("==============================================")
 sys.stdout.flush()
@@ -158,6 +166,10 @@ def main() -> None:
             "torch_profiler_dir": PROFILE_DIR,
         }
 
+    ep_kwargs = {}
+    if ENABLE_EP:
+        ep_kwargs["enable_expert_parallel"] = True
+
     llm = LLM(
         model=MODEL,
         hf_overrides=HF_OVERRIDES,
@@ -171,6 +183,7 @@ def main() -> None:
         enable_prefix_caching=False,
         distributed_executor_backend="mp",
         tensor_parallel_size=TP_SIZE,
+        **ep_kwargs,
         **profiler_kwargs,
     )
 
