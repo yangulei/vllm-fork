@@ -590,39 +590,23 @@ class xpu_ops:
         inbatch_seq_indices = token_indices - cu_seq_lens[batch_indices]
 
         # Find which block each token belongs to
-        block_indices_in_table = inbatch_seq_indices // cache_block_size
-        physical_block_indices = block_table[batch_indices, block_indices_in_table]
+        # NOTE: inbatch_seq_indices is 1-based, so use (x-1)//bs for 0-based
+        # block index (consistent with inblock_offsets below)
+        block_indices_in_table = (inbatch_seq_indices - 1) // cache_block_size
+        physical_block_indices = block_table[batch_indices,
+                                             block_indices_in_table]
 
         # Calculate the offset within each block
         inblock_offsets = (inbatch_seq_indices - 1) % cache_block_size
 
-        # Calculate strides
-        block_stride = kv_cache.stride(0)  # stride for each block
-
-        # Flatten kv_cache for easier indexing
-        kv_cache_flat = kv_cache.reshape(-1)
-
-        # Calculate source offset for K values for all tokens (vectorized)
-        src_block_offsets = physical_block_indices * block_stride
-        src_k_offsets = src_block_offsets + inblock_offsets * head_dim
-
-        # Gather K values using advanced indexing
-        # Create indices for all elements we need to gather
-        k_indices = src_k_offsets.unsqueeze(1) + torch.arange(
-            head_dim, device=dst_k.device
-        )
-        dst_k[:] = kv_cache_flat[k_indices]
-
-        # Calculate source offset for scale values (vectorized)
-        # Scales are stored after all K values for each block
+        # Use direct tensor indexing (handles non-contiguous kv_cache correctly)
+        # kv_cache: [num_blocks, block_size, K+scale]
         scale_size = head_dim * 4 // quant_block_size
-        src_scale_offsets = src_block_offsets + head_dim + inblock_offsets * scale_size
 
-        # Gather scale values
-        scale_indices = src_scale_offsets.unsqueeze(1) + torch.arange(
-            scale_size, device=dst_scale.device
-        )
-        dst_scale[:] = kv_cache_flat[scale_indices]
+        # Gather K and scale using advanced indexing on the 3D tensor
+        gathered = kv_cache[physical_block_indices, inblock_offsets]  # [N, D]
+        dst_k[:] = gathered[:, :head_dim]
+        dst_scale[:] = gathered[:, head_dim:head_dim + scale_size]
 
     @staticmethod
     def top_k_per_row_prefill(
