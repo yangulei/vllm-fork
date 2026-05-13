@@ -219,11 +219,12 @@ class XPUOneDNNFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # Use base class weight processing only (no transpose).
-        # We do NOT pre-transpose the weight here because other code paths
-        # (e.g. DSv4 wo_a dequant) access layer.weight directly and expect
-        # the original (N, K) layout. The transpose to (K, N) for oneDNN
-        # is done at runtime in apply_block_scaled_mm via B.t().
+        # Use base class weight processing only (no scale transpose here).
+        # We do NOT pre-transpose the scale because other code paths
+        # (e.g. DSv4 wo_a dequant) access layer.weight_scale_inv directly
+        # and expect the original (N_groups, K_groups) layout.
+        # The transpose to (K_groups, N_groups) for oneDNN is done at
+        # runtime in apply_block_scaled_mm.
         super().process_weights_after_loading(layer)
 
     def apply_weights(
@@ -280,8 +281,13 @@ class XPUOneDNNFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             Bs = torch.exp2(Bs.view(torch.uint8).to(torch.float32) - 127.0)
         # B is (N, K); oneDNN expects (K, N). Use .t() (non-contiguous view)
         # — oneDNN auto-detects nt format from strides, no copy needed.
+        # Scale must also be transposed: original Bs is (N_groups, K_groups)
+        # matching (N, K) weight layout; oneDNN needs (K_groups, N_groups)
+        # to match the (K, N) logical layout of B.t().
+        # Must be contiguous — oneDNN reads scale from physical memory layout.
         return torch.ops._xpu_C.fp8_gemm(
-            A, B.t(), self.config.out_dtype, As, Bs, torch.Tensor()
+            A, B.t(), self.config.out_dtype, As,
+            Bs.t().contiguous(), torch.Tensor()
         )
 
 
