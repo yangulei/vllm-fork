@@ -3,11 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""bf16 Triton port of the DeepSeek-V4 C4 KV insert kernel.
+"""XPU bf16 fused compress + RMSNorm + RoPE + KV cache insert kernel.
 
-This matches the CUDA C4 compressor kernel's compress + RMSNorm + RoPE math,
-but intentionally skips the FP8/UE8M0 quantization path and stores the full
-512-dim vector into a bf16 paged KV cache.
+Fused kernel for DeepSeek-V4 compressor on XPU: gathers state cache entries,
+computes softmax-weighted compression, applies RMSNorm and RoPE, then stores
+the resulting 512-dim vector into a bf16 paged KV cache.
+Used for all MLA compressor layers (compress_ratio=4 or 128, head_dim=512).
 """
 
 import torch
@@ -19,7 +20,7 @@ TRITON_BLOCK_SIZE = 512
 
 
 @triton.jit
-def _c4_kv_insert_bf16_kernel(
+def _xpu_compress_insert_bf16_kernel(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
@@ -138,7 +139,7 @@ def _c4_kv_insert_bf16_kernel(
              mask=valid_offsets & should_store)
 
 
-def _ref_c4_kv_insert_bf16(
+def _ref_compress_insert_bf16(
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     positions: torch.Tensor,
@@ -226,7 +227,7 @@ def _ref_c4_kv_insert_bf16(
         k_cache[kv_block_idx, kv_pos_in_block] = normed.to(torch.bfloat16)
 
 
-def c4_kv_insert_bf16(
+def xpu_compress_insert_bf16(
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     positions: torch.Tensor,
@@ -271,7 +272,7 @@ def c4_kv_insert_bf16(
         return
 
     if state_cache.device.type != "xpu":
-        _ref_c4_kv_insert_bf16(
+        _ref_compress_insert_bf16(
             state_cache=state_cache,
             token_to_req_indices=token_to_req_indices,
             positions=positions,
@@ -291,7 +292,7 @@ def c4_kv_insert_bf16(
 
     num_tokens = positions.numel()
     state_width = state_cache.shape[-1] // 2
-    _c4_kv_insert_bf16_kernel[(num_tokens,)](
+    _xpu_compress_insert_bf16_kernel[(num_tokens,)](
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
@@ -319,4 +320,4 @@ def c4_kv_insert_bf16(
     )
 
 
-__all__ = ["c4_kv_insert_bf16"]
+__all__ = ["xpu_compress_insert_bf16"]

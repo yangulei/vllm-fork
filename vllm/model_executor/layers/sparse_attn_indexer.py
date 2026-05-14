@@ -293,7 +293,6 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
-        raw_kv_cache = kv_cache
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -350,14 +349,12 @@ def sparse_attn_indexer(
             if q_decode.ndim == 3:
                 q_decode = q_decode.reshape(batch_size, next_n,
                                             *q_decode.shape[1:])
-            # SYCL kernel expects packed KV cache [blocks, bs, 1, D+4]
-            kv_cache_packed = raw_kv_cache.unsqueeze(-2)
             # context_lens: 1D [B] — take the max per-batch seq_len
             # (last spec token sees the most KV entries)
             context_lens = seq_lens[:, -1].to(torch.int32).contiguous()
             logits = torch.ops._xpu_C.fp8_paged_mqa_logits(
                 q_decode,
-                kv_cache_packed,
+                kv_cache,
                 weights[:num_padded_tokens].float().contiguous(),
                 context_lens,
                 decode_metadata.block_table.to(torch.int32).contiguous(),

@@ -165,6 +165,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         from vllm.platforms import current_platform
+        # NOTE: FlashMLA requires 576B alignment, but XPU's xpu_compress_insert_bf16 kernel requires 512B alignment.
         alignment = 512 if current_platform.is_xpu() else 576
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
@@ -246,13 +247,13 @@ class DeepseekCompressor(nn.Module):
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
         )
-        self._is_xpu_c4 = False
+        self._is_xpu_bf16_compressor = False
 
         if current_platform.is_xpu() and self.head_dim == 512:
-            self._xpu_c4_kv_insert = import_module(
-                "vllm.v1.attention.ops.deepseek_v4_ops.c4_kv_insert_bf16"
-            ).c4_kv_insert_bf16
-            self._is_xpu_c4 = True
+            self._xpu_compress_insert = import_module(
+                "vllm.v1.attention.ops.deepseek_v4_ops.xpu_compress_insert_bf16"
+            ).xpu_compress_insert_bf16
+            self._is_xpu_bf16_compressor = True
         elif self.head_dim == 512:
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
@@ -357,9 +358,9 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        if self._is_xpu_c4:
-            logger.info_once("XPU: C4 KV insert (bf16) kernel dispatched")
-            self._xpu_c4_kv_insert(
+        if self._is_xpu_bf16_compressor:
+            logger.info_once("XPU: MLA compress+insert (bf16) kernel dispatched")
+            self._xpu_compress_insert(
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
                 positions=positions,

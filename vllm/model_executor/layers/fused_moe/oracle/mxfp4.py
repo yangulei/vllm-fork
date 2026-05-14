@@ -445,18 +445,7 @@ def select_mxfp4_moe_backend(
             else:
                 logger.debug_once(_make_log_unsupported(backend, reason))
 
-    if current_platform.is_xpu():
-        backend = Mxfp4MoeBackend.XPU
-        logger.info_once(_make_log_backend(backend))
-        return _return_or_raise(
-            Mxfp4MoeBackend.XPU,
-            config,
-            kMxfp4Static,
-            None,
-            activation_format,
-        )
-
-    if current_platform.is_cuda() or current_platform.is_rocm():
+    if current_platform.is_cuda() or current_platform.is_rocm() or current_platform.is_xpu():
         raise NotImplementedError(
             "No MXFP4 MoE backend supports the deployment configuration."
         )
@@ -537,6 +526,8 @@ def select_deepseek_v4_mxfp4_moe_backend(
             Mxfp4MoeBackend.TRITON_UNFUSED,
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
         ]
+    elif current_platform.is_xpu():
+        priority_backends = [Mxfp4MoeBackend.XPU]
     else:
         priority_backends = _get_priority_backends()
 
@@ -552,17 +543,6 @@ def select_deepseek_v4_mxfp4_moe_backend(
                 return backend, k_cls
             else:
                 logger.debug_once(_make_log_unsupported(backend, reason), scope="local")
-
-    if current_platform.is_xpu():
-        backend = Mxfp4MoeBackend.XPU
-        logger.info_once(_make_log_backend(backend), scope="local")
-        return _return_or_raise(
-            backend,
-            config,
-            kMxfp4Static,
-            None,
-            activation_format,
-        )
 
     raise NotImplementedError(
         "No MXFP4 MoE backend supports the deployment configuration."
