@@ -1522,8 +1522,7 @@ class DeepseekV4Model(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
 
-@torch.compile(backend=current_platform.simple_compile_backend,
-             disable=current_platform.is_xpu())
+@torch.compile(backend=current_platform.simple_compile_backend)
 def hc_head(
     hidden_states: torch.Tensor,
     hc_fn: torch.Tensor,

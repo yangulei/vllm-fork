@@ -348,7 +348,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             G = self.n_local_groups
             if wo_a_w.ndim == 2:
                 wo_a_w = wo_a_w.view(G, wo_a_w.shape[0] // G, wo_a_w.shape[1])
-                wo_a_s = wo_a_s.view(G, wo_a_s.shape[0] // G, wo_a_s.shape[1])
+            # Pass 2D scale directly — the dequant kernel accepts both
+            # original (N_groups, K_groups) and pre-transposed (K_groups,
+            # N_groups) layouts via stride arithmetic, zero-copy.
             wo_a_bf16 = torch.ops.vllm.dequant_fp8_block128_to_bf16(
                 wo_a_w, wo_a_s, 128)
 

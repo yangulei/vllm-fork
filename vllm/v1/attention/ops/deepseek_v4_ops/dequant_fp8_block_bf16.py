@@ -28,6 +28,7 @@ def _dequant_fp8_block128_to_bf16_kernel(
     fp8_stride_o,
     scale_stride_g,
     scale_stride_o,
+    scale_stride_r,
     out_stride_g,
     out_stride_o,
     BLOCK_O: tl.constexpr,
@@ -54,7 +55,10 @@ def _dequant_fp8_block128_to_bf16_kernel(
     )
     fp8_vals = tl.load(fp8_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-    scale = tl.load(scale_ptr + pid_g * scale_stride_g + pid_o * scale_stride_o + pid_r)
+    scale = tl.load(
+        scale_ptr + pid_g * scale_stride_g
+        + pid_o * scale_stride_o + pid_r * scale_stride_r
+    )
     bf16_vals = (fp8_vals * scale).to(tl.bfloat16)
 
     out_ptrs = (
@@ -79,15 +83,54 @@ def dequant_fp8_block128_to_bf16(
     assert scale.dtype == torch.float32
     assert fp8_weight.ndim == 3
     G, O_dim, R_dim = fp8_weight.shape
-    assert scale.shape[0] == G
-    assert scale.shape[1] == (O_dim + block - 1) // block
-    assert scale.shape[2] == (R_dim + block - 1) // block
+    O_groups = (O_dim + block - 1) // block
+    R_groups = (R_dim + block - 1) // block
     assert fp8_weight.is_contiguous()
-    assert scale.is_contiguous()
+
+    # Accept scale in multiple layouts:
+    #   3D (G, O_groups, R_groups) — original
+    #   3D (G, R_groups, O_groups) — transposed per-group
+    #   2D (N_groups, K_groups)    — original 2D (N=G*O, K=R)
+    #   2D (K_groups, N_groups)    — pre-transposed for oneDNN
+    # All layouts are handled via stride arithmetic — no data copy.
+    if scale.ndim == 3:
+        assert scale.shape[0] == G
+        if scale.shape[1] == O_groups and scale.shape[2] == R_groups:
+            scale_stride_g = scale.stride(0)
+            scale_stride_o = scale.stride(1)
+            scale_stride_r = scale.stride(2)
+        elif scale.shape[1] == R_groups and scale.shape[2] == O_groups:
+            scale_stride_g = scale.stride(0)
+            scale_stride_o = scale.stride(2)
+            scale_stride_r = scale.stride(1)
+        else:
+            raise ValueError(
+                f"3D scale shape {scale.shape} doesn't match weight "
+                f"({G}, {O_dim}, {R_dim}) with block={block}"
+            )
+    elif scale.ndim == 2:
+        N_groups = G * O_groups
+        if scale.shape == (N_groups, R_groups):
+            # Original 2D: scale[g*O_groups + pid_o, pid_r]
+            scale_stride_g = scale.stride(0) * O_groups
+            scale_stride_o = scale.stride(0)
+            scale_stride_r = scale.stride(1)
+        elif scale.shape == (R_groups, N_groups):
+            # Pre-transposed 2D: scale[pid_r, g*O_groups + pid_o]
+            scale_stride_g = scale.stride(1) * O_groups
+            scale_stride_o = scale.stride(1)
+            scale_stride_r = scale.stride(0)
+        else:
+            raise ValueError(
+                f"2D scale shape {scale.shape} doesn't match weight "
+                f"({G}, {O_dim}, {R_dim}) with block={block}"
+            )
+    else:
+        raise ValueError(f"scale must be 2D or 3D, got {scale.ndim}D")
 
     out = torch.empty((G, O_dim, R_dim), dtype=torch.bfloat16, device=fp8_weight.device)
 
-    grid = (G, scale.shape[1], scale.shape[2])
+    grid = (G, O_groups, R_groups)
     _dequant_fp8_block128_to_bf16_kernel[grid](
         fp8_weight,
         scale,
@@ -96,8 +139,9 @@ def dequant_fp8_block128_to_bf16(
         R_dim,
         fp8_weight.stride(0),
         fp8_weight.stride(1),
-        scale.stride(0),
-        scale.stride(1),
+        scale_stride_g,
+        scale_stride_o,
+        scale_stride_r,
         out.stride(0),
         out.stride(1),
         BLOCK_O=block,
