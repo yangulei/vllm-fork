@@ -9,9 +9,6 @@ Strategy:
      no intermediate index tensors.
   2. Call xpu_sparse_mla_bf16 (per-head Triton kernel optimized for
      D=512 MQA with num_warps=16).
-
-This replaces the previous CUTLASS paged decode which used a Python
-for-loop gather + flash_attn_varlen_func.
 """
 
 import torch
@@ -135,7 +132,7 @@ def fused_dual_gather(
     )
 
 
-class CutlassSparseDecodeState:
+class XpuSparseDecodeState:
     """Pre-allocated workspace for Triton sparse decode.
 
     Instantiate once per attention layer. All buffers are sized for the

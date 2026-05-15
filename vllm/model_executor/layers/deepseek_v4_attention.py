@@ -976,12 +976,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
 
                 # Lazy-init CUTLASS decode state (once per layer)
-                if not hasattr(self, '_cutlass_decode_state'):
-                    from vllm.v1.attention.ops.deepseek_v4_ops.cutlass_sparse_decode import (  # noqa: E501
-                        CutlassSparseDecodeState,
+                if not hasattr(self, '_xpu_decode_state'):
+                    from vllm.v1.attention.ops.deepseek_v4_ops.xpu_sparse_decode import (  # noqa: E501
+                        XpuSparseDecodeState,
                     )
                     max_batch = self.max_num_seqs
-                    self._cutlass_decode_state = CutlassSparseDecodeState(
+                    self._xpu_decode_state = XpuSparseDecodeState(
                         num_heads=q.shape[1],
                         head_dim=q.shape[2],
                         max_model_len=self.max_model_len,
@@ -995,7 +995,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         self.compress_ratio, max_batch,
                     )
 
-                self._cutlass_decode_state(
+                self._xpu_decode_state(
                     q=q,
                     kv_cache=kv_cache,
                     swa_kv_cache=self.swa_cache_layer.kv_cache,
