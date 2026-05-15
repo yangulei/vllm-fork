@@ -22,7 +22,7 @@ BLOCK_K = 64
 
 
 @triton.jit
-def _c4_sparse_prefill_bf16_kernel(
+def _xpu_sparse_mla_bf16_kernel(
     q_ptr,
     kv_ptr,
     topk_indices_ptr,
@@ -128,7 +128,7 @@ def _ref_c4_sparse_prefill(
     return out.to(torch.bfloat16)
 
 
-def c4_sparse_prefill_bf16(
+def xpu_sparse_mla_bf16(
     q: torch.Tensor,
     kv_workspace: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -167,7 +167,7 @@ def c4_sparse_prefill_bf16(
     k_max = topk_indices.shape[1]
 
     grid = (T, H)
-    _c4_sparse_prefill_bf16_kernel[grid](
+    _xpu_sparse_mla_bf16_kernel[grid](
         q,
         kv_workspace,
         topk_indices,
@@ -187,4 +187,4 @@ def c4_sparse_prefill_bf16(
     )
 
 
-__all__ = ["c4_sparse_prefill_bf16"]
+__all__ = ["xpu_sparse_mla_bf16"]

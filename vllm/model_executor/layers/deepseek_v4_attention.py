@@ -1335,7 +1335,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
-        # Drives c4_sparse_prefill_bf16 for any compress_ratio in (4, 128).
+        # Drives xpu_sparse_mla_bf16 for any compress_ratio in (4, 128).
         # The kernel is generic over slot indices; ratio only changes the
         # topk_indices source:
         #   C4A   -> Indexer-filled topk_indices_buffer  (sparse top-k)
@@ -1347,10 +1347,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             xpu_v4_gather_k_cache_bf16,
         )
 
-        c4_sparse_prefill_bf16 = import_module(
+        xpu_sparse_mla_bf16 = import_module(
             "vllm.v1.attention.ops.deepseek_v4_ops."
-            "c4_sparse_prefill_bf16"
-        ).c4_sparse_prefill_bf16
+            "xpu_sparse_mla_bf16"
+        ).xpu_sparse_mla_bf16
 
         assert attn_metadata is not None
         assert compressed_k_cache is not None
@@ -1448,7 +1448,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             kv_workspace = kv[:chunk_size].view(-1, q.shape[-1])
-            c4_sparse_prefill_bf16(
+            xpu_sparse_mla_bf16(
                 q=q[query_start:query_end],
                 kv_workspace=kv_workspace,
                 topk_indices=combined_indices,

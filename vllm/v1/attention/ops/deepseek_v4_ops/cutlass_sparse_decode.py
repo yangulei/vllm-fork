@@ -7,7 +7,7 @@ Strategy:
   1. Fused Triton kernel gathers topk + SWA KV slots from two separate
      caches into a compacted flat workspace — single kernel launch,
      no intermediate index tensors.
-  2. Call c4_sparse_prefill_bf16 (per-head Triton kernel optimized for
+  2. Call xpu_sparse_mla_bf16 (per-head Triton kernel optimized for
      D=512 MQA with num_warps=16).
 
 This replaces the previous CUTLASS paged decode which used a Python
@@ -206,8 +206,8 @@ class CutlassSparseDecodeState:
         softmax_scale: float,
         out: torch.Tensor,           # [B, num_heads, head_dim]
     ) -> None:
-        from vllm.v1.attention.ops.deepseek_v4_ops.c4_sparse_prefill_bf16 import (  # noqa: E501
-            c4_sparse_prefill_bf16,
+        from vllm.v1.attention.ops.deepseek_v4_ops.xpu_sparse_mla_bf16 import (  # noqa: E501
+            xpu_sparse_mla_bf16,
         )
 
         B = q.shape[0]
@@ -240,7 +240,7 @@ class CutlassSparseDecodeState:
         combined_lens = (topk_lens + swa_lens).to(torch.int32)
 
         # Call Triton sparse prefill kernel (optimized for D=512 MQA)
-        c4_sparse_prefill_bf16(
+        xpu_sparse_mla_bf16(
             q=q,
             kv_workspace=ws.view(-1, head_dim),
             topk_indices=self._ws_indices[:B, :K_total],
