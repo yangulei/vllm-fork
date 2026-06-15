@@ -165,6 +165,18 @@ _TEXT_GENERATION_MODELS = {
     "MiniMaxText01ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxM1ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxM2ForCausalLM": ("minimax_m2", "MiniMaxM2ForCausalLM"),
+    # XPU: brought forward from vllm-project/vllm#45381 (m3_release). The package
+    # entry point is platform-isolated and lazy (see vllm/models/minimax_m3); on
+    # XPU the MSA path runs through the common Triton indexer + block-sparse
+    # attend. Kept identical to upstream for a clean rebase once the M3 PR lands.
+    "MiniMaxM3SparseForCausalLM": (
+        "vllm.models.minimax_m3",
+        "MiniMaxM3SparseForCausalLM",
+    ),
+    "MiniMaxM3SparseForConditionalGeneration": (
+        "vllm.models.minimax_m3",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ),
     "Ministral3ForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralLarge3ForCausalLM": ("mistral_large_3", "MistralLarge3ForCausalLM"),

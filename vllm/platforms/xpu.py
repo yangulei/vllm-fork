@@ -47,6 +47,13 @@ class XPUPlatform(Platform):
             import vllm._moe_C  # noqa: F401
 
     @classmethod
+    def is_arch_support_pdl(cls) -> bool:
+        # PDL (programmatic dependent launch) is a CUDA SM9+ feature. XPU has no
+        # equivalent, so the MiniMax-M3 / DeepSeek-V4 sparse Triton kernels must
+        # omit the ``launch_pdl`` runtime kwarg on XPU.
+        return False
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",

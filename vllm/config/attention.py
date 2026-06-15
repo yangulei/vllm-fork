@@ -12,6 +12,12 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
+# XPU: brought forward from vllm-project/vllm#45381 (m3_release). Type alias for
+# the MiniMax-M3 / DeepSeek-V4 sparse-attention indexer K-cache dtype, imported
+# by ``vllm.models.minimax_m3.common.indexer``. Kept identical to upstream so it
+# rebases cleanly once the M3 PR lands.
+IndexerKVDType = Literal["bf16", "fp8", "mxfp4", "nvfp4"]
+
 
 @config
 class AttentionConfig:
