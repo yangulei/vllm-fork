@@ -11,6 +11,9 @@ reasons:
 import importlib
 
 __all__ = [
+    "MiniMaxM3VLImageProcessor",
+    "MiniMaxM3VLVideoProcessor",
+    "MiniMaxVLProcessor",
     "BagelProcessor",
     "CheersProcessor",
     "CohereASRProcessor",
@@ -44,6 +47,9 @@ __all__ = [
 
 _CLASS_TO_MODULE: dict[str, str] = {
     "BagelProcessor": "vllm.transformers_utils.processors.bagel",
+    "MiniMaxM3VLImageProcessor": "vllm.transformers_utils.processors.minimax_m3",
+    "MiniMaxM3VLVideoProcessor": "vllm.transformers_utils.processors.minimax_m3",
+    "MiniMaxVLProcessor": "vllm.transformers_utils.processors.minimax_m3",
     "CheersProcessor": "vllm.transformers_utils.processors.cheers",
     "CohereASRProcessor": "vllm.transformers_utils.processors.cohere_asr",
     "DeepseekVLV2Processor": "vllm.transformers_utils.processors.deepseek_vl2",

@@ -41,6 +41,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HYV3Config": "vllm.transformers_utils.configs.hy_v3",
     "HyperCLOVAXConfig": "vllm.transformers_utils.configs.hyperclovax",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
+    # XPU: MiniMax-M3 configs brought forward from vllm-project/vllm#45381.
+    "MiniMaxM3Config": "vllm.transformers_utils.configs.minimax_m3",
+    "MiniMaxM3MTPConfig": "vllm.transformers_utils.configs.minimax_m3",
+    "MiniMaxM3TextConfig": "vllm.transformers_utils.configs.minimax_m3",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
     # `FalconConfig` class from the official HuggingFace transformers library.
@@ -85,6 +89,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
 
 __all__ = [
     "AfmoeConfig",
+    "MiniMaxM3Config",
+    "MiniMaxM3MTPConfig",
+    "MiniMaxM3TextConfig",
     "AXK1Config",
     "BagelConfig",
     "CheersConfig",
