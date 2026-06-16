@@ -3851,12 +3851,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     q_out: torch.Tensor | None = None,
     index_q_out: torch.Tensor | None = None,
 ) -> None:
-    op = (
-        torch.ops._xpu_C.fused_minimax_m3_qknorm_rope_kv_insert
-        if current_platform.is_xpu()
-        else torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert
-    )
-    op(
+    torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
         q_norm_weight,
         k_norm_weight,
