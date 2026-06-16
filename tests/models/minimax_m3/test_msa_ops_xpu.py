@@ -22,6 +22,7 @@ import torch
 
 from vllm.models.minimax_m3.common.ops.index_topk import (
     SPARSE_BLOCK_SIZE,
+    minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
@@ -206,3 +207,61 @@ def test_indexer_score_topk_selection(seq_len):
         checked += 1
     assert checked > 0, "no multi-block query positions were exercised"
     assert torch.isfinite(score[0, :, :nblk_total]).any()
+
+
+@pytest.mark.parametrize("num_kv_heads", [4, 16])
+def test_indexer_decode_runs(num_kv_heads):
+    """Decode lightning indexer (single query token) runs on Intel Triton.
+
+    The decode score kernel's per-block dot has an output dim == num_index_heads
+    (4 for real MiniMax-M3). Intel Triton's ``tl.dot`` requires that dim >= 16,
+    so the kernel uses an explicit fp32 reduction for the indexer score; this
+    test guards both the small (4) and >=16 cases against a reference top-k.
+    """
+    torch.manual_seed(3)
+    head_dim = 64
+    seq_len = 400
+    max_blocks = (seq_len + B - 1) // B
+    sm_scale = 1.0 / (head_dim**0.5)
+    dtype = torch.bfloat16
+    num_reqs = 2
+    decode_query_len = 1
+    total_q = num_reqs * decode_query_len
+    topk = 2
+
+    idx_q = torch.randn(total_q, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    index_kv_cache = torch.randn(
+        num_reqs * max_blocks, B, head_dim, device=DEVICE, dtype=dtype
+    )
+    block_table = torch.empty(num_reqs, max_blocks, dtype=torch.int32, device=DEVICE)
+    for r in range(num_reqs):
+        for b in range(max_blocks):
+            block_table[r, b] = r * max_blocks + b
+    seq_lens = torch.tensor([seq_len, seq_len], dtype=torch.int32, device=DEVICE)
+
+    topk_idx = minimax_m3_index_decode(
+        idx_q, index_kv_cache, block_table, seq_lens, seq_len, topk,
+        init_blocks=0, local_blocks=0, num_kv_heads=num_kv_heads,
+        sm_scale=sm_scale, decode_query_len=decode_query_len,
+    )
+    torch.xpu.synchronize()
+    assert topk_idx.shape == (num_kv_heads, total_q, topk)
+
+    # Reference: max-over-block score then top-k, per head/request.
+    nblk = max_blocks
+    for r in range(num_reqs):
+        K = torch.cat([index_kv_cache[int(block_table[r, b])] for b in range(nblk)], 0)
+        K = K[:seq_len].float()  # [seq_len, head_dim]
+        for h in range(num_kv_heads):
+            dots = (K @ idx_q[r, h].float()) * sm_scale  # [seq_len]
+            blk_scores = []
+            for blk in range(nblk):
+                lo, hi = blk * B, min((blk + 1) * B, seq_len)
+                blk_scores.append(dots[lo:hi].max().item())
+            ref_top = set(
+                torch.tensor(blk_scores).topk(topk).indices.tolist()
+            )
+            sel = {x for x in topk_idx[h, r, :].tolist() if x >= 0}
+            assert sel == ref_top, (
+                f"head {h} req {r}: selected {sorted(sel)} != ref {sorted(ref_top)}"
+            )

@@ -368,7 +368,14 @@ def _decode_index_score_kernel(
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
         )  # [N,D]
-        kq = tl.dot(k, q) * sm_scale_log2e  # [N,H]
+        # XPU: Intel Triton's tl.dot requires the output dim >= 16, but here it
+        # equals num_idx_heads (4 for MiniMax-M3). Compute k @ q with an explicit
+        # fp32 reduction over the head dim instead, which is portable and cheap
+        # at this tiny H. q is [D,H], k is [N,D] -> kq is [N,H].
+        kq = tl.sum(
+            k[:, :, None].to(tl.float32) * q[None, :, :].to(tl.float32), axis=1
+        )  # [N,H]
+        kq = kq * sm_scale_log2e
         kq = tl.where(pos_mask[:, None], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [H]
         is_init = blk < init_blocks
