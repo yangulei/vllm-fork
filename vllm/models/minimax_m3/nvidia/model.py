@@ -131,7 +131,22 @@ class MiniMAXGemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+        # XPU: flashinfer is CUDA-only; fall back to a native Gemma RMSNorm
+        # (x * rsqrt(mean(x^2)+eps) * (1+weight)) on platforms without it.
+        try:
+            from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+        except ImportError:
+            def _gemma_rmsnorm(t: torch.Tensor) -> torch.Tensor:
+                orig = t.dtype
+                tf = t.float()
+                var = tf.pow(2).mean(-1, keepdim=True)
+                tf = tf * torch.rsqrt(var + self.variance_epsilon)
+                return (tf * (1.0 + self.weight.float())).to(orig)
+
+            if residual is None:
+                return _gemma_rmsnorm(x)
+            added = x + residual
+            return _gemma_rmsnorm(added), added
 
         if residual is None:
             return gemma_rmsnorm(x, self.weight, self.variance_epsilon)

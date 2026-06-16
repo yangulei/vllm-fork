@@ -166,9 +166,18 @@ class SiluAndMulWithClamp(CustomOp):
         return: (num_tokens, d) or (batch_size, seq_len, d)
     """
 
-    def __init__(self, swiglu_limit: float, *, compile_native: bool = True):
+    def __init__(
+        self,
+        swiglu_limit: float,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        *,
+        compile_native: bool = True,
+    ):
         super().__init__(compile_native=compile_native)
         self.swiglu_limit = float(swiglu_limit)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
         if current_platform.is_rocm() or current_platform.is_xpu():
             self._forward_method = self.forward_native
         elif current_platform.is_cuda_alike():
@@ -177,10 +186,12 @@ class SiluAndMulWithClamp(CustomOp):
             self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU-OAI: gate * sigmoid(alpha * gate) * (up + beta). The defaults
+        # alpha=1.0, beta=0.0 reduce this to silu(gate) * up.
         d = x.shape[-1] // 2
         gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
         up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
-        return F.silu(gate) * up
+        return gate * torch.sigmoid(self.alpha * gate) * (up + self.beta)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2

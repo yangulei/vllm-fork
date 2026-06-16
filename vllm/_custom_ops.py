@@ -3823,3 +3823,57 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+# XPU: MiniMax-M3 fused attention pre-processing. The model forward calls
+# ``ops.fused_minimax_m3_qknorm_rope_kv_insert``; on XPU this dispatches to the
+# SYCL kernel registered by vllm-xpu-kernels under ``torch.ops._xpu_C`` (the
+# CUDA build registers it under ``torch.ops._C``). Brought forward from
+# vllm-project/vllm#45381 with the XPU dispatch added.
+def fused_minimax_m3_qknorm_rope_kv_insert(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    index_q_norm_weight: torch.Tensor | None = None,
+    index_k_norm_weight: torch.Tensor | None = None,
+    num_index_heads: int = 0,
+    slot_mapping: torch.Tensor | None = None,
+    index_slot_mapping: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    index_cache: torch.Tensor | None = None,
+    block_size: int = 0,
+    q_out: torch.Tensor | None = None,
+    index_q_out: torch.Tensor | None = None,
+) -> None:
+    op = (
+        torch.ops._xpu_C.fused_minimax_m3_qknorm_rope_kv_insert
+        if current_platform.is_xpu()
+        else torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert
+    )
+    op(
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        rotary_dim,
+        eps,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        num_index_heads,
+        slot_mapping,
+        index_slot_mapping,
+        kv_cache,
+        index_cache,
+        block_size,
+        q_out,
+        index_q_out,
+    )

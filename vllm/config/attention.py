@@ -34,6 +34,11 @@ class AttentionConfig:
     """Use separate prefill and decode kernels for attention instead of
     the unified triton kernel."""
 
+    # XPU: brought forward from vllm-project/vllm#45381 (m3_release).
+    indexer_kv_dtype: IndexerKVDType = "bf16"
+    """Data type for the sparse-attention indexer K cache. Quantized formats
+    (fp8, mxfp4, nvfp4) require indexer kernel support in the backend."""
+
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
 

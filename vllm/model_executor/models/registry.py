@@ -1328,10 +1328,19 @@ class _ModelRegistry:
         return model_cls.supports_transcription_only
 
 
+# XPU: brought forward from vllm-project/vllm#45381. Allow registry entries to
+# point at fully-qualified module paths (e.g. ``vllm.models.minimax_m3``) for
+# models that live outside the legacy flat ``vllm.model_executor.models`` layout.
+def _resolve_module_name(mod_relname: str) -> str:
+    if mod_relname.startswith("vllm."):
+        return mod_relname
+    return f"vllm.model_executor.models.{mod_relname}"
+
+
 ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
-            module_name=f"vllm.model_executor.models.{mod_relname}",
+            module_name=_resolve_module_name(mod_relname),
             class_name=cls_name,
         )
         for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()

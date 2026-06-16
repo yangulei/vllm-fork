@@ -86,6 +86,10 @@ class LazyConfigDict(dict):
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     afmoe="AfmoeConfig",
+    # XPU: MiniMax-M3 configs brought forward from vllm-project/vllm#45381.
+    minimax_m3_vl="MiniMaxM3Config",
+    minimax_m3_mtp="MiniMaxM3MTPConfig",
+    minimax_m3_text="MiniMaxM3TextConfig",
     bagel="BagelConfig",
     umm="CheersConfig",
     chatglm="ChatGLMConfig",
