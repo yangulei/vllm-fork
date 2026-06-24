@@ -10,6 +10,7 @@ from torch.nn import Module
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -250,6 +251,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         elif self.unquantized_backend == UnquantizedMoeBackend.XPU:
             w13 = layer.w13_weight
             w2 = layer.w2_weight
+
+            # MiniMax-M3 packs w13 as [all gates; all ups] (uninterleaved) and
+            # requests the "swigluoai_uninterleave" activation. The XPU
+            # swigluoai_and_mul kernel is interleaved-only (gate = even cols,
+            # up = odd cols), so permute the gate/up rows here into the
+            # interleaved [g0, u0, g1, u1, ...] layout once, then run the
+            # standard interleaved SWIGLUOAI kernel. Must happen before the
+            # transpose below (the gate/up split is on the 2*I axis).
+            # Done per-expert in place to avoid a full second copy of w13 (which
+            # can be many GiB and OOM on small-VRAM cards at low TP).
+            if layer.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+                num_experts, two_i, hidden = w13.shape
+                half = two_i // 2
+                tmp = torch.empty(
+                    (two_i, hidden), dtype=w13.dtype, device=w13.device
+                )
+                for e in range(num_experts):
+                    block = w13.data[e]
+                    tmp[0::2] = block[:half]   # gates -> even rows
+                    tmp[1::2] = block[half:]   # ups   -> odd rows
+                    block.copy_(tmp)
+                del tmp
+                layer.activation = MoEActivation.SWIGLUOAI
 
             w13.data = w13.transpose(-1, -2).contiguous()
             w2.data = w2.transpose(-1, -2).contiguous()

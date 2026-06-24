@@ -71,6 +71,11 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             MoEActivation.SILU,
             MoEActivation.GELU,
             MoEActivation.SWIGLUOAI,
+            # Uninterleaved SwiGLU-OAI (MiniMax-M3) is supported by interleaving
+            # the w13 gate/up rows at weight-load time (see the XPU branch of
+            # UnquantizedFusedMoEMethod.process_weights_after_loading), after
+            # which it runs as the interleaved SWIGLUOAI kernel.
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.RELU2_NO_MUL,
         ]
 

@@ -18,6 +18,12 @@ class MoEActivation(Enum):
     GELU_TANH = "gelu_tanh"
     RELU2 = "relu2"
     SWIGLUOAI = "swigluoai"
+    # SwiGLU-OAI on the uninterleaved [all gates; all ups] layout (e.g.
+    # MiniMax-M3, whose w13 is packed via MergedColumnParallelLinear). Distinct
+    # from SWIGLUOAI, which assumes the interleaved gpt-oss [g0,u0,g1,u1,...]
+    # layout. On XPU the gate/up rows are interleaved once at weight-load time
+    # and this is rewritten to SWIGLUOAI (the XPU kernel is interleaved-only).
+    SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
     SWIGLUSTEP = "swiglustep"
 
     # Non-gated activations (no mul with gate) expect input of shape [..., d]
@@ -73,6 +79,7 @@ _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.GELU: "gelu_and_mul",
     MoEActivation.GELU_TANH: "gelu_tanh_and_mul",
     MoEActivation.SWIGLUOAI: "swigluoai_and_mul",
+    MoEActivation.SWIGLUOAI_UNINTERLEAVE: "swigluoai_and_mul",
     MoEActivation.SWIGLUSTEP: "swiglustep_and_mul",
     MoEActivation.RELU2: "relu2",
     MoEActivation.SILU_NO_MUL: "silu_and_mul",
@@ -129,6 +136,15 @@ def apply_moe_activation(
         torch.ops._C.gelu_tanh_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUOAI:
         torch.ops._C.swigluoai_and_mul(output, input)
+    elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+        # No interleaved/uninterleaved variant of the compiled kernel exists,
+        # so apply the SwiGLU-OAI formula natively on the [gate | up] halves
+        # (gpt-oss defaults alpha=1.702, limit=7.0). The XPU fused path avoids
+        # this by interleaving weights at load time and using SWIGLUOAI.
+        d = output.size(-1)
+        gate = input[..., :d].clamp(max=7.0)
+        up = input[..., d:].clamp(min=-7.0, max=7.0)
+        output.copy_((up + 1.0) * (gate * torch.sigmoid(gate * 1.702)))
     elif activation == MoEActivation.SWIGLUSTEP:
         from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
 

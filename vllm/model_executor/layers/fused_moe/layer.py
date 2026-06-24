@@ -272,6 +272,8 @@ class FusedMoE(PluggableLayer):
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
         swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
         e_score_correction_bias: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -305,6 +307,12 @@ class FusedMoE(PluggableLayer):
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
         self.swiglu_limit = swiglu_limit
+        # SwiGLU-OAI parameters (e.g. MiniMax-M3). The XPU swigluoai_and_mul
+        # kernel bakes in alpha=1.702 / limit=7.0 (the gpt-oss defaults), which
+        # match these models; they are stored here for signature compatibility
+        # with the NVIDIA FusedMoE and for any backend that consumes them.
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
 
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
