@@ -122,8 +122,7 @@ def _gqa_sparse_fwd_kernel(
     real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
     bt_row = block_table_ptr + pid_b * stride_bt_b
     off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
+    kv_base = kv_cache_ptr + pid_kh * stride_kv_h
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
@@ -154,43 +153,40 @@ def _gqa_sparse_fwd_kernel(
             t_ptr_j = t_ptr_j + stride_tk
             c = blk * BLOCK_SIZE_K
             page = tl.load(bt_row + blk).to(tl.int64)
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            k = tl.load(
-                kv_cache_ptr
-                + page * stride_kv_blk
-                + 0 * stride_kv_kv
-                + off_n[None, :] * stride_kv_pos
-                + pid_kh * stride_kv_h
-                + off_d[:, None] * stride_kv_d,
-                mask=d_mask[:, None] & pos_mask[None, :],
-                other=0.0,
+            pos_mask = (c + off_n) < seq_len
+            page_off = page * stride_kv_blk
+            # 2D Tensor Descriptors (DPAS + 2D block IO) over the (pos, head_dim)
+            # page; descriptor masks cols >= head_dim, the page rows are valid.
+            k_desc = tl.make_tensor_descriptor(
+                base=kv_base + page_off,
+                shape=(BLOCK_SIZE_K, head_dim),
+                strides=(stride_kv_pos, stride_kv_d),
+                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
             )
+            k = k_desc.load([0, 0])  # (pos, head_dim)
             if USE_FP8:
                 k = k.to(q.dtype)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
             qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            qk += tl.dot(q, k) * sm_scale_log2e
+            qk += tl.dot(q, tl.trans(k)) * sm_scale_log2e
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
             p = tl.exp2(qk - m_ij[:, None])
             l_ij = tl.sum(p, axis=1)
             acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-            v = tl.load(
-                kv_cache_ptr
-                + page * stride_kv_blk
-                + 1 * stride_kv_kv
-                + off_n[:, None] * stride_kv_pos
-                + pid_kh * stride_kv_h
-                + off_d[None, :] * stride_kv_d,
-                mask=pos_mask[:, None] & d_mask[None, :],
-                other=0.0,
+            v_desc = tl.make_tensor_descriptor(
+                base=kv_base + page_off + stride_kv_kv,
+                shape=(BLOCK_SIZE_K, head_dim),
+                strides=(stride_kv_pos, stride_kv_d),
+                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
             )
+            v = v_desc.load([0, 0])  # (pos, head_dim)
             if USE_FP8:
                 v = v.to(q.dtype)
-            acc_o += tl.dot(p.to(v.dtype), v)
+            # explicit accumulator form maps directly to a single DPAS.
+            acc_o = tl.dot(p.to(v.dtype), v, acc_o)
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
@@ -294,63 +290,61 @@ def _gqa_sparse_decode_kernel(
     chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
 
     off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
     bt_row = block_table_ptr + req_id * stride_bt_b
 
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_ptrs = tl.make_block_ptr(
+    # 2D device-side Tensor Descriptor for Q (DPAS + 2D block IO). The descriptor
+    # masks rows >= gqa_group_size and cols >= head_dim to zero, so no manual
+    # boundary handling is needed.
+    q_desc = tl.make_tensor_descriptor(
         base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
         shape=(gqa_group_size, head_dim),
         strides=(stride_qh, stride_qd),
-        offsets=(0, 0),
         block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = q_desc.load([0, 0])
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
+    # Per kv-head base; each selected block is one full 128-position page, so the
+    # K/V slabs are 2D (pos, head_dim) blocks with a contiguous last dim.
+    kv_base = kv_cache_ptr + pid_kh * stride_kv_h
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
         blk = tl.load(cur_idx_ptr).to(tl.int32)
         cur_idx_ptr = cur_idx_ptr + stride_tk
         c = blk * BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
-        pos = c + off_n
-        pos_mask = pos < kv_len
-        k = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + 0 * stride_kv_kv
-            + off_n[None, :] * stride_kv_pos
-            + pid_kh * stride_kv_h
-            + off_d[:, None] * stride_kv_d,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
+        pos_mask = (c + off_n) < kv_len
+        page_off = page * stride_kv_blk
+        k_desc = tl.make_tensor_descriptor(
+            base=kv_base + page_off,
+            shape=(BLOCK_SIZE_K, head_dim),
+            strides=(stride_kv_pos, stride_kv_d),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
         )
+        k = k_desc.load([0, 0])  # (pos, head_dim)
         if USE_FP8:
             k = k.to(q.dtype)
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+        # explicit (q @ k.T) so it maps to a single DPAS; positions past kv_len
+        # are masked to -inf for the softmax (the page rows themselves are valid).
+        qk = tl.dot(q, tl.trans(k)) * sm_scale_log2e
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-        qk += tl.dot(q, k) * sm_scale_log2e
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
         acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-        v = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + 1 * stride_kv_kv
-            + off_n[:, None] * stride_kv_pos
-            + pid_kh * stride_kv_h
-            + off_d[None, :] * stride_kv_d,
-            mask=pos_mask[:, None] & d_mask[None, :],
-            other=0.0,
+        v_desc = tl.make_tensor_descriptor(
+            base=kv_base + page_off + stride_kv_kv,
+            shape=(BLOCK_SIZE_K, head_dim),
+            strides=(stride_kv_pos, stride_kv_d),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
         )
+        v = v_desc.load([0, 0])  # (pos, head_dim)
         if USE_FP8:
             v = v.to(q.dtype)
-        acc_o += tl.dot(p.to(v.dtype), v)
+        # explicit accumulator form maps directly to a single DPAS instruction.
+        acc_o = tl.dot(p.to(v.dtype), v, acc_o)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 
@@ -361,15 +355,13 @@ def _gqa_sparse_decode_kernel(
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    o_ptrs = tl.make_block_ptr(
+    o_desc = tl.make_tensor_descriptor(
         base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
         shape=(gqa_group_size, head_dim),
         strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
         block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
     )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+    o_desc.store([0, 0], acc_o.to(o_ptr.dtype.element_ty))
     lse_ptrs = tl.make_block_ptr(
         base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
         shape=(gqa_group_size,),
