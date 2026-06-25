@@ -31,12 +31,23 @@ _SPARSE_ATTN_NUM_STAGES_KWARG: dict | None = None
 def _sparse_attn_num_stages_kwarg() -> dict:
     """Triton ``num_stages`` override for the sparse-attn GEMM kernels.
 
-    Forced only where required: CDNA3 (gfx942) caps LDS at
-    64 KB, and the default 2-stage pipeline double-buffers the 128x128 K/V tiles
-    to ~66 KB ("out of resource: shared memory"), so pin gfx942 to a single
-    stage (~32 KB, which fits). Everywhere else (NVIDIA, CDNA4 gfx950) return an
-    empty kwarg and let Triton keep its own default -- don't second-guess it.
-    Cached: the arch is fixed per process.
+    Forced to a single stage on the backends where the default multi-stage
+    pipeline is counter-productive:
+
+    * **CDNA3 (gfx942)** caps LDS at 64 KB, and the default 2-stage pipeline
+      double-buffers the 128x128 K/V tiles to ~66 KB ("out of resource: shared
+      memory"), so pin gfx942 to a single stage (~32 KB, which fits).
+    * **XPU (Intel Xe2 / BMG)** has no async-copy pipeline; the 2-stage software
+      pipeline instead *prefetches* the next iteration's 128x128 K and V
+      dot-operands into registers. In SIMD16 that overflows the 256-register GRF
+      and spills ~11.7 KB/thread, so the decode/prefill kernels run ~99 %
+      XVE_STALL_SBID (waiting on spill/fill traffic). Pinning ``num_stages=1``
+      removes the double-buffer and the spill: ~1.6x decode and ~1.5x prefill
+      (profiled on Arc Pro B60, unitrace VectorEngineStalls + device timing).
+
+    Everywhere else (NVIDIA, CDNA4 gfx950) return an empty kwarg and let Triton
+    keep its own default -- don't second-guess it. Cached: arch is fixed per
+    process.
     """
     global _SPARSE_ATTN_NUM_STAGES_KWARG
     if _SPARSE_ATTN_NUM_STAGES_KWARG is None:
@@ -46,6 +57,8 @@ def _sparse_attn_num_stages_kwarg() -> dict:
 
             if on_gfx942():
                 kwarg = {"num_stages": 1}
+        elif current_platform.is_xpu():
+            kwarg = {"num_stages": 1}
         _SPARSE_ATTN_NUM_STAGES_KWARG = kwarg
     return _SPARSE_ATTN_NUM_STAGES_KWARG
 
