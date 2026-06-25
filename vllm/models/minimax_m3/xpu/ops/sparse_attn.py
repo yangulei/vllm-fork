@@ -50,6 +50,27 @@ def _sparse_attn_num_stages_kwarg() -> dict:
     return _SPARSE_ATTN_NUM_STAGES_KWARG
 
 
+_SPARSE_ATTN_PREFILL_WARPS_KWARG: dict | None = None
+
+
+def _sparse_attn_prefill_warps_kwarg() -> dict:
+    """Triton ``num_warps`` override for the block-sparse *prefill* GEMM kernel.
+
+    The prefill kernel runs one query token per program (``BLOCK_SIZE_Q == 1``),
+    so the GEMM is a tiny M == gqa_group_size tile and the kernel is
+    latency/occupancy-bound rather than DPAS-bound. On XPU, ``num_warps=1`` lets
+    far more programs co-reside per Xe-core and is ~3.5x faster than Triton's
+    default for this Tensor-Descriptor kernel (swept 1/2/4/8). Other backends
+    keep the Triton default. Cached: the arch is fixed per process.
+    """
+    global _SPARSE_ATTN_PREFILL_WARPS_KWARG
+    if _SPARSE_ATTN_PREFILL_WARPS_KWARG is None:
+        _SPARSE_ATTN_PREFILL_WARPS_KWARG = (
+            {"num_warps": 1} if current_platform.is_xpu() else {}
+        )
+    return _SPARSE_ATTN_PREFILL_WARPS_KWARG
+
+
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
 # blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
@@ -485,6 +506,7 @@ def minimax_m3_sparse_attn(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_FP8=use_fp8,
         **_sparse_attn_num_stages_kwarg(),
+        **_sparse_attn_prefill_warps_kwarg(),
     )
 
 
