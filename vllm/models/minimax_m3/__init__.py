@@ -28,6 +28,11 @@ elif current_platform.is_xpu():
         MiniMaxM3SparseForConditionalGeneration,
     )
     from .xpu.mtp import MiniMaxM3MTP  # type: ignore[assignment]
+    from .xpu.ops import install_xpu_sparse_attn
+
+    # Route the cross-platform Triton block-sparse attend to the XPU-tuned
+    # kernels (xpu/ops/sparse_attn.py) without editing the common module.
+    install_xpu_sparse_attn()
 else:
     from .amd.model import (  # type: ignore[assignment]
         MiniMaxM3SparseForCausalLM,
