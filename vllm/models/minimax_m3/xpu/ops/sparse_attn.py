@@ -70,16 +70,24 @@ def _sparse_attn_prefill_warps_kwarg() -> dict:
     """Triton ``num_warps`` override for the block-sparse *prefill* GEMM kernel.
 
     The prefill kernel runs one query token per program (``BLOCK_SIZE_Q == 1``),
-    so the GEMM is a tiny M == gqa_group_size tile and the kernel is
-    latency/occupancy-bound rather than DPAS-bound. On XPU, ``num_warps=1`` lets
-    far more programs co-reside per Xe-core and is ~3.5x faster than Triton's
-    default for this Tensor-Descriptor kernel (swept 1/2/4/8). Other backends
-    keep the Triton default. Cached: the arch is fixed per process.
+    so the GEMM tile is M == gqa_group_size rows by BLOCK_SIZE_K(==128) columns.
+    On XPU each warp is a SIMD16 subgroup; with ``num_warps=1`` a single 16-lane
+    subgroup must hold the whole 128x128 K and V dot-operands, which overflows
+    the 256-entry GRF and spills ~47 KB/thread -- the prefill kernel then runs
+    ~91 % XVE_STALL waiting on spill/fill traffic (occupancy is already ~91 %, so
+    it is *not* occupancy-bound). ``num_warps=2`` splits that same tile across two
+    subgroups (32 lanes), cutting spill to ~16 KB and giving a uniform **2.1x-7.4x**
+    speedup across all prefill shapes (~3x->18 TFLOPS on Arc Pro B60, unitrace
+    ComputeBasic + device timing; swept 1/2/4/8 -- 4 and 8 don't cut spill further
+    and lose co-residency, so 2 is the optimum). Shrinking BLOCK_SIZE_K (smaller
+    KV pages / inner sub-tiling) was also measured and is *slower* than 2 warps:
+    the extra loop trips + masking underutilize the DPAS. Other backends keep the
+    Triton default. Cached: the arch is fixed per process.
     """
     global _SPARSE_ATTN_PREFILL_WARPS_KWARG
     if _SPARSE_ATTN_PREFILL_WARPS_KWARG is None:
         _SPARSE_ATTN_PREFILL_WARPS_KWARG = (
-            {"num_warps": 1} if current_platform.is_xpu() else {}
+            {"num_warps": 2} if current_platform.is_xpu() else {}
         )
     return _SPARSE_ATTN_PREFILL_WARPS_KWARG
 
