@@ -171,15 +171,20 @@ def _gqa_sparse_fwd_kernel(
         off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
         real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        # BLOCK_SIZE_Q == 1, so a single query token is a 2D (gqa_group_size,
+        # head_dim) tile. Load it via a device-side Tensor Descriptor (DPAS + 2D
+        # block IO); it masks rows >= gqa_group_size and cols >= head_dim to zero,
+        # matching the old boundary_check + padding_option="zero". This feeds the
+        # DPAS directly and is a net win across shapes. NOTE: the symmetric o-store
+        # is deliberately left as a make_block_ptr below -- benchmarking showed a
+        # descriptor store regresses the largest prefill shapes (q=8192) by ~20%.
+        q_desc = tl.make_tensor_descriptor(
+            base=q_ptr + (q_start + pid_q_j) * stride_qn + pid_h * stride_qh,
+            shape=(gqa_group_size, head_dim),
+            strides=(stride_qh, stride_qd),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+        q = q_desc.load([0, 0])
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
