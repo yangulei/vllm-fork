@@ -24,6 +24,37 @@ from vllm.utils.math_utils import round_up
 SPARSE_BLOCK_SIZE = 128
 
 
+_INDEX_SCORE_KWARG: dict | None = None
+
+
+def _index_score_kwarg() -> dict:
+    """Triton ``num_stages`` / ``num_warps`` override for the *prefill* lightning-
+    indexer block-score GEMM kernel (``_index_block_score_kernel``).
+
+    The kernel streams every causal 128-token index-K block and does
+    ``tl.dot(q[64, head_dim], k[head_dim, 128]) -> [64, 128]`` per block. On XPU
+    each warp is a SIMD16 (16-lane) subgroup; at the Triton default
+    (``num_warps=4`` here) a 64-lane group must hold the 128x128 K dot-operand
+    plus the 64x128 result, which overflows the 256-entry GRF and spills
+    ~21 KB/thread -- the kernel then runs bound on spill/fill traffic.
+    ``num_warps=16`` spreads that same tile across 256 lanes, dropping the spill
+    to **0** and giving a uniform **3.8x-9x** speedup across all prefill shapes
+    (~2.6ms -> ~0.28ms at q=2048/ctx=8192 on Arc Pro B60; unitrace device timing
+    + do_bench. Swept 1/2/4/8/16/32 -- 16 is the optimum; 32 over-splits and
+    regresses). ``num_stages=1`` is the XPU no-async-prefetch default and is
+    neutral here (1 vs 2 measured identical) but kept for consistency with the
+    block-sparse attend kernels. Other backends keep the Triton default. Cached:
+    the arch is fixed per process.
+    """
+    global _INDEX_SCORE_KWARG
+    if _INDEX_SCORE_KWARG is None:
+        _INDEX_SCORE_KWARG = (
+            {"num_stages": 1, "num_warps": 16} if current_platform.is_xpu()
+            else {}
+        )
+    return _INDEX_SCORE_KWARG
+
+
 # ---------------------------------------------------------------------------
 # Bitonic top-k helpers (layout-agnostic).
 # ---------------------------------------------------------------------------
@@ -701,6 +732,7 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        **_index_score_kwarg(),
     )
     return score
 
