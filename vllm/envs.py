@@ -269,6 +269,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_XPU_USE_XATTENTION_MSA: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
 
 
@@ -1785,6 +1786,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # Whether to dispatch the MiniMax-M3 sparse-attention (MSA) lightning
+    # indexer and block-sparse attend to the xattention SYCL kernels
+    # (``flash_attn_2_xpu``) when that extension is importable. When enabled
+    # (default) and available, these kernels are used in place of the Triton
+    # XPU fallbacks; set to 0 to force the Triton path.
+    "VLLM_XPU_USE_XATTENTION_MSA": lambda: bool(
+        int(os.getenv("VLLM_XPU_USE_XATTENTION_MSA", "1"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
