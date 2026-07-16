@@ -109,7 +109,13 @@ def fused_topk_bias(
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ):
-    if not rocm_aiter_ops.is_fused_moe_enabled() and not current_platform.is_xpu():
+    use_fused_kernel = not rocm_aiter_ops.is_fused_moe_enabled()
+    if current_platform.is_xpu():
+        # XPU exposes fused _moe_C kernels only for softmax/sigmoid scoring.
+        # sqrtsoftplus has no XPU kernel, so let it fall through to the eager
+        # path below instead of dispatching to a missing op.
+        use_fused_kernel = scoring_func in ("softmax", "sigmoid")
+    if use_fused_kernel:
         assert hidden_states.size(0) == gating_output.size(0), (
             "Number of tokens mismatch"
         )
