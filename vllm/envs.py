@@ -1789,7 +1789,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to dispatch the MiniMax-M3 sparse-attention (MSA) lightning
     # indexer and block-sparse attend to the xattention SYCL kernels
-    # (``flash_attn_2_xpu``) when that extension is importable. When enabled
+    # (``xattention._C``) when that extension is importable. When enabled
     # (default) and available, these kernels are used in place of the Triton
     # XPU fallbacks; set to 0 to force the Triton path.
     "VLLM_XPU_USE_XATTENTION_MSA": lambda: bool(

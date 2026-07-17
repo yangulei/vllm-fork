@@ -30,7 +30,7 @@ def _use_xattention_msa() -> bool:
 def install_xpu_sparse_attn() -> None:
     """Route MiniMax-M3 block-sparse attention to the fastest available XPU impl.
 
-    Prefers the xattention SYCL kernels (``flash_attn_2_xpu``) when the extension
+    Prefers the xattention SYCL kernels (``xattention._C``) when the extension
     is built and ``VLLM_XPU_USE_XATTENTION_MSA`` is set (default); otherwise falls
     back to the XPU-tuned Triton kernels (``xpu/ops/sparse_attn.py``).
 
@@ -46,7 +46,7 @@ def install_xpu_sparse_attn() -> None:
     if _use_xattention_msa():
         logger.info_once(
             "MiniMax-M3: dispatching block-sparse attention to xattention "
-            "(flash_attn_2_xpu) SYCL kernels."
+            "(xattention._C) SYCL kernels."
         )
         _common_attn.minimax_m3_sparse_attn = _xattn.minimax_m3_sparse_attn
         _common_attn.minimax_m3_sparse_attn_decode = (
@@ -61,7 +61,7 @@ def install_xpu_sparse_attn() -> None:
 def install_xpu_index_topk() -> None:
     """Route the MiniMax-M3 lightning indexer to the fastest available XPU impl.
 
-    Prefers the xattention SYCL kernels (``flash_attn_2_xpu``) when the extension
+    Prefers the xattention SYCL kernels (``xattention._C``) when the extension
     is built and ``VLLM_XPU_USE_XATTENTION_MSA`` is set (default); otherwise falls
     back to the XPU-tuned Triton kernels (``xpu/ops/index_topk.py``).
 
@@ -77,7 +77,7 @@ def install_xpu_index_topk() -> None:
     if _use_xattention_msa():
         logger.info_once(
             "MiniMax-M3: dispatching lightning indexer to xattention "
-            "(flash_attn_2_xpu) SYCL kernels."
+            "(xattention._C) SYCL kernels."
         )
         _common_indexer.minimax_m3_index_score = _xattn.minimax_m3_index_score
         _common_indexer.minimax_m3_index_topk = _xattn.minimax_m3_index_topk

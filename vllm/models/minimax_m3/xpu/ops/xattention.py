@@ -5,7 +5,7 @@
 The lightning indexer (block score + top-k) and block-sparse GQA attend for
 MiniMax-M3 have hand-tuned SYCL/SYCL-TLA implementations in the ``xattention``
 extension (``intel-innersource/...xattention``), exposed as pybind functions on
-the ``flash_attn_2_xpu`` module:
+the ``xattention._C`` module:
 
   * ``minimax_m3_index_score`` / ``minimax_m3_index_topk`` -- prefill indexer.
   * ``minimax_m3_index_decode``                           -- decode indexer.
@@ -22,8 +22,8 @@ from functools import cache
 
 import torch
 
-# The xattention pybind extension module name (see setup.py ``flash_attn_2_xpu``).
-_XATTENTION_MODULE = "flash_attn_2_xpu"
+# The xattention pybind extension module name (see setup.py ``xattention._C``).
+_XATTENTION_MODULE = "xattention._C"
 
 # The MSA ops the extension must export for this dispatch path to be usable.
 _REQUIRED_OPS = (
@@ -37,14 +37,14 @@ _REQUIRED_OPS = (
 
 @cache
 def _load_xattention():
-    """Import ``flash_attn_2_xpu`` once, returning the module or ``None``.
+    """Import ``xattention._C`` once, returning the module or ``None``.
 
     Returns ``None`` if the extension is not installed or was built without the
     MSA kernels (``XATTENTION_ENABLED_KERNELS_MSA``), so callers can fall back to
     the Triton XPU kernels. Cached so the import is attempted at most once.
     """
     try:
-        import flash_attn_2_xpu as _msa
+        import xattention._C as _msa
     except ImportError:
         return None
     if not all(hasattr(_msa, op) for op in _REQUIRED_OPS):
