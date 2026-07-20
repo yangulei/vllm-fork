@@ -139,6 +139,13 @@ class XPUPlatform(Platform):
         torch.xpu.set_device(device)
 
     @classmethod
+    def current_stream(cls) -> torch.xpu.Stream:
+        # Used by vllm.utils.torch_utils.current_stream() on XPU. Enables the
+        # MoE shared-experts aux-stream overlap path to obtain the compute
+        # stream for cross-stream synchronization.
+        return torch.xpu.current_stream()
+
+    @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         torch.xpu.manual_seed_all(seed)
 

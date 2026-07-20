@@ -741,8 +741,14 @@ def aux_stream() -> torch.cuda.Stream | None:
 
     from vllm.platforms import current_platform
 
-    if _aux_stream is None and current_platform.is_cuda_alike():
-        _aux_stream = torch.cuda.Stream()
+    if _aux_stream is None:
+        if current_platform.is_cuda_alike():
+            _aux_stream = torch.cuda.Stream()
+        elif current_platform.is_xpu():
+            # Enable MoE shared_expert overlap on XPU (Intel GPU). torch.xpu
+            # provides the same Stream/wait_stream/record_stream API used by
+            # the shared-experts runner.
+            _aux_stream = torch.xpu.Stream()
 
     return _aux_stream
 

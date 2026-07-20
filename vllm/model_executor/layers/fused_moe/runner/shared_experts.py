@@ -69,14 +69,14 @@ class SharedExperts:
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
         if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
-            logger.debug_once("Disabling MoE shared_experts cuda stream")
+            logger.debug_once("Disabling MoE shared_experts aux stream")
             self._stream = None
         else:
-            # TODO(rob): enable shared expert overlap with non-cuda-alike.
-            # aux_stream() returns None on non-cuda-alike platforms.
+            # aux_stream() returns a dedicated stream on cuda-alike and XPU
+            # platforms, and None elsewhere (e.g. CPU).
             self._stream = aux_stream()
             if self._stream is not None:
-                logger.debug_once("Enabled separate cuda stream for MoE shared_experts")
+                logger.debug_once("Enabled separate aux stream for MoE shared_experts")
 
     @property
     def _disable_shared_experts_overlap(self) -> bool:
@@ -100,7 +100,7 @@ class SharedExperts:
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
         should_run_shared_in_aux_stream = (
-            current_platform.is_cuda()
+            (current_platform.is_cuda() or current_platform.is_xpu())
             and self._stream is not None
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
