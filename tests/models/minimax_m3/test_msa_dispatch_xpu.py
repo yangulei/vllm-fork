@@ -4,7 +4,7 @@
 
 These verify the *routing* logic in ``vllm.models.minimax_m3.xpu.ops`` — that
 the lightning indexer and block-sparse attend are dispatched to the xattention
-SYCL kernels (``xattention._C``) when that extension is available and
+SYCL kernels (the ``xattention`` package) when that extension is available and
 ``VLLM_XPU_USE_XATTENTION_MSA`` is set, and fall back to the Triton XPU kernels
 otherwise. The routing is exercised with a stub extension so the test runs on
 CPU without XPU hardware or a built extension.
@@ -15,46 +15,43 @@ import types
 
 import pytest
 
+# The framework-neutral entry points the extension must export. The
+# shim rejects a build that lacks them (e.g. one built without
+# ``XATTENTION_ENABLED_KERNELS=msa``) and falls back to Triton.
 _MSA_OPS = (
-    "minimax_m3_index_score",
-    "minimax_m3_index_topk",
-    "minimax_m3_index_decode",
-    "minimax_m3_sparse_attn",
-    "minimax_m3_sparse_attn_decode",
+    "msa_index_score",
+    "msa_index_topk",
+    "msa_index_decode",
+    "msa_sparse_attn",
+    "msa_sparse_attn_decode",
 )
 
 
-def _make_stub_extension() -> types.ModuleType:
-    stub = types.ModuleType("xattention._C")
-    for op in _MSA_OPS:
+def _make_stub_extension(ops: tuple[str, ...] = _MSA_OPS) -> types.ModuleType:
+    stub = types.ModuleType("xattention")
+    stub.__path__ = []  # mark as a package
+    for op in ops:
         setattr(stub, op, lambda *a, **k: None)
     return stub
 
 
 def _install_stub_extension(monkeypatch, ext: types.ModuleType | None) -> None:
-    """Install a stub ``xattention._C`` (or force its import to fail).
+    """Install a stub ``xattention`` package (or force its import to fail).
 
-    ``import xattention._C`` first imports the ``xattention`` parent package, so
-    a lightweight stub parent is registered to keep the real (XPU-only) package
-    off the import path. Passing ``ext=None`` registers a ``None`` submodule
-    entry, which makes ``import xattention._C`` raise ``ImportError``.
+    Keeps the real (XPU-only) package off the import path. Passing ``ext=None``
+    registers a ``None`` entry in ``sys.modules``, which makes
+    ``import xattention`` raise ``ImportError``.
     """
-    parent = types.ModuleType("xattention")
-    parent.__path__ = []  # mark as a package
-    monkeypatch.setitem(sys.modules, "xattention", parent)
-    monkeypatch.setitem(sys.modules, "xattention._C", ext)
-    if ext is not None:
-        parent._C = ext
+    monkeypatch.setitem(sys.modules, "xattention", ext)
 
 
 @pytest.fixture
 def _clear_xattn_cache():
-    """Reset the cached ``xattention._C`` import between cases."""
+    """Reset the cached ``xattention`` import between cases."""
     from vllm.models.minimax_m3.xpu.ops import xattention as xattn
 
     xattn._load_xattention.cache_clear()
     yield
-    sys.modules.pop("xattention._C", None)
     sys.modules.pop("xattention", None)
     xattn._load_xattention.cache_clear()
 
@@ -104,6 +101,21 @@ def test_dispatch_respects_disable_env(monkeypatch, _clear_xattn_cache):
     """With the extension present but the toggle off, use the Triton kernels."""
     monkeypatch.setenv("VLLM_XPU_USE_XATTENTION_MSA", "0")
     _install_stub_extension(monkeypatch, _make_stub_extension())
+
+    from vllm.models.minimax_m3.common import sparse_attention as sa
+    from vllm.models.minimax_m3.xpu import ops
+
+    assert ops._use_xattention_msa() is False
+    ops.install_xpu_sparse_attn()
+    assert sa.minimax_m3_sparse_attn.__module__.endswith("xpu.ops.sparse_attn")
+
+
+def test_dispatch_falls_back_when_msa_kernels_not_built(
+    monkeypatch, _clear_xattn_cache
+):
+    """An xattention build without the MSA kernels must not be selected."""
+    monkeypatch.setenv("VLLM_XPU_USE_XATTENTION_MSA", "1")
+    _install_stub_extension(monkeypatch, _make_stub_extension(ops=("msa_index_score",)))
 
     from vllm.models.minimax_m3.common import sparse_attention as sa
     from vllm.models.minimax_m3.xpu import ops
